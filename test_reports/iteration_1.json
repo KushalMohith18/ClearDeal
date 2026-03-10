@@ -42,7 +42,7 @@
   "seed_data_creation": "Created test users: testowner@cleardeal.com (owner), testbrand@cleardeal.com (brand_manager). Created companies, billboard (ID: 167da8b7-0d07-43b0-b911-91686d489756), and deal (ID: 5225f758) in Pending Approval state.",
   "retest_needed": false,
   "should_main_agent_self_test": true,
-  "context_for_next_testing_agent": "Test credentials: testowner@cleardeal.com/test123 (owner with company+billboard) and testbrand@cleardeal.com/test123 (brand_manager with company). Existing deal 5225f758-eddd-40b8-9d30-020c414c422b in pending_approval state. All MOCKED APIs (GST/Aadhaar/Bank verification) working correctly. App URL: https://minimum-viable-2.preview.emergentagent.com",
+  "context_for_next_testing_agent": "Test credentials: testowner@cleardeal.com/test123 (owner with company+billboard) and testbrand@cleardeal.com/test123 (brand_manager with company). Existing deal 5225f758-eddd-40b8-9d30-020c414c422b in pending_approval state. All MOCKED APIs (GST/Aadhaar/Bank verification) working correctly. App URL: https://deal-bidding-hub.preview.emergentagent.com",
   "flows_verified": {
     "landing_page": "PASS - Hero section, features, how-it-works all visible",
     "register_owner": "PASS - Registration with Billboard Owner role works",

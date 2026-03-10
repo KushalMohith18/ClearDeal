@@ -197,6 +197,37 @@ def safe_user(user: dict) -> dict:
     return {k: v for k, v in user.items() if k not in ["_id", "password_hash"]}
 
 
+# ============ HARDCODED BENCHMARKS ============
+HARDCODED_BENCHMARKS = {
+    "hitech": {"min": 80000, "max": 120000, "label": "Hitech City"},
+    "banjara": {"min": 60000, "max": 100000, "label": "Banjara Hills"},
+    "gachibowli": {"min": 50000, "max": 90000, "label": "Gachibowli"},
+    "jubilee": {"min": 70000, "max": 110000, "label": "Jubilee Hills"},
+    "madhapur": {"min": 40000, "max": 80000, "label": "Madhapur"},
+    "kondapur": {"min": 35000, "max": 65000, "label": "Kondapur"},
+    "kukatpally": {"min": 25000, "max": 55000, "label": "Kukatpally"},
+    "secunderabad": {"min": 30000, "max": 60000, "label": "Secunderabad"},
+    "default": {"min": 30000, "max": 70000, "label": "Hyderabad"}
+}
+
+
+# ============ NOTIFICATION HELPER ============
+async def create_notification(user_id: str, notif_type: str, title: str, message: str, deal_id: Optional[str] = None):
+    try:
+        await db.notifications.insert_one({
+            "id": str(uuid.uuid4()),
+            "user_id": user_id,
+            "type": notif_type,
+            "title": title,
+            "message": message,
+            "deal_id": deal_id,
+            "is_read": False,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        })
+    except Exception as e:
+        logger.error(f"Notification error: {e}")
+
+
 # ============ AUTH ROUTES ============
 @api_router.post("/auth/register")
 async def register(data: UserCreate):
@@ -523,6 +554,13 @@ async def create_deal(data: DealCreate, current_user=Depends(get_current_user)):
         "created_at": datetime.now(timezone.utc).isoformat()
     })
     deal_doc.pop("_id", None)
+    # Notify billboard owner of new offer
+    owner_users = await db.users.find(
+        {"company_id": billboard["owner_company_id"]}, {"_id": 0, "id": 1}
+    ).to_list(10)
+    for ou in owner_users:
+        await create_notification(ou["id"], "new_offer", "New Offer Received",
+            f"New offer of ₹{data.initial_offer:,.0f}/month for {billboard['title']}", deal_id)
     return deal_doc
 
 
@@ -881,6 +919,430 @@ async def accept_invite(invite_id: str, data: dict):
     await db.invites.update_one({"id": invite_id}, {"$set": {"status": "accepted", "accepted_by": user_id}})
     token = create_token(user_id)
     return {"token": token, "user": safe_user(user_doc)}
+
+
+# ============ NEW V2 MODELS ============
+class RepSettings(BaseModel):
+    price_band_min: Optional[float] = None
+    price_band_max: Optional[float] = None
+    budget_ceiling: Optional[float] = None
+    deal_approval_mode: str = "auto"
+    commission_visibility: bool = True
+    is_active: bool = True
+
+
+class CampaignCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    billboard_ids: List[str]
+    campaign_start_date: str
+    campaign_end_date: str
+    total_budget: float
+
+
+class DisputeCreate(BaseModel):
+    reason: str
+    description: str
+
+
+class ThreadLockData(BaseModel):
+    reason: Optional[str] = "Thread locked by manager"
+
+
+# ============ MANAGER REP CONTROLS (A) ============
+@api_router.put("/companies/reps/{rep_id}/settings")
+async def update_rep_settings(rep_id: str, data: RepSettings, current_user=Depends(get_current_user)):
+    if current_user["role"] == "rep":
+        raise HTTPException(status_code=403, detail="Only managers can update rep settings")
+    company_id = current_user.get("company_id")
+    rep = await db.users.find_one({"id": rep_id, "company_id": company_id}, {"_id": 0})
+    if not rep:
+        raise HTTPException(status_code=404, detail="Rep not found in your company")
+    await db.users.update_one(
+        {"id": rep_id},
+        {"$set": {
+            "price_band_min": data.price_band_min,
+            "price_band_max": data.price_band_max,
+            "budget_ceiling": data.budget_ceiling,
+            "deal_approval_mode": data.deal_approval_mode,
+            "commission_visibility": data.commission_visibility,
+            "is_active": data.is_active
+        }}
+    )
+    return {"success": True, "message": "Rep settings updated"}
+
+
+@api_router.post("/companies/reps/{rep_id}/deactivate")
+async def deactivate_rep(rep_id: str, current_user=Depends(get_current_user)):
+    if current_user["role"] == "rep":
+        raise HTTPException(status_code=403, detail="Only managers can deactivate reps")
+    company_id = current_user.get("company_id")
+    rep = await db.users.find_one({"id": rep_id, "company_id": company_id})
+    if not rep:
+        raise HTTPException(status_code=404, detail="Rep not found")
+    await db.users.update_one({"id": rep_id}, {"$set": {"is_active": False}})
+    return {"success": True, "message": "Rep deactivated"}
+
+
+@api_router.post("/companies/reps/{rep_id}/activate")
+async def activate_rep(rep_id: str, current_user=Depends(get_current_user)):
+    if current_user["role"] == "rep":
+        raise HTTPException(status_code=403, detail="Only managers can activate reps")
+    company_id = current_user.get("company_id")
+    rep = await db.users.find_one({"id": rep_id, "company_id": company_id})
+    if not rep:
+        raise HTTPException(status_code=404, detail="Rep not found")
+    await db.users.update_one({"id": rep_id}, {"$set": {"is_active": True}})
+    return {"success": True, "message": "Rep activated"}
+
+
+# ============ CONTRACT ROUTES (F1) ============
+@api_router.get("/deals/{deal_id}/contract")
+async def get_contract(deal_id: str, current_user=Depends(get_current_user)):
+    deal = await db.deals.find_one({"id": deal_id}, {"_id": 0})
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    if deal["status"] not in ["pending_approval", "approved", "paid", "active", "completed"]:
+        raise HTTPException(status_code=400, detail="Contract not available at this stage")
+    company_id = current_user.get("company_id")
+    has_access = (company_id in [deal["seller_company_id"], deal["buyer_company_id"]] or deal["rep_id"] == current_user["id"])
+    if not has_access:
+        raise HTTPException(status_code=403, detail="Access denied")
+    buyer = await db.companies.find_one({"id": deal["buyer_company_id"]}, {"_id": 0})
+    seller = await db.companies.find_one({"id": deal["seller_company_id"]}, {"_id": 0})
+    billboard = await db.billboards.find_one({"id": deal["billboard_id"]}, {"_id": 0, "min_acceptable_price": 0, "max_rep_discount_percent": 0})
+    rep = await db.users.find_one({"id": deal["rep_id"]}, {"_id": 0, "password_hash": 0})
+    return {
+        "contract_number": f"CD-{deal_id[:8].upper()}",
+        "deal": deal,
+        "buyer": buyer,
+        "seller": seller,
+        "billboard": billboard,
+        "rep": rep,
+        "generated_at": datetime.now(timezone.utc).isoformat()
+    }
+
+
+@api_router.post("/deals/{deal_id}/sign")
+async def sign_contract(deal_id: str, current_user=Depends(get_current_user)):
+    deal = await db.deals.find_one({"id": deal_id}, {"_id": 0})
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    if deal["status"] not in ["pending_approval", "approved"]:
+        raise HTTPException(status_code=400, detail="Cannot sign at this stage")
+    if current_user["role"] == "rep":
+        raise HTTPException(status_code=403, detail="Only Org Managers can sign contracts")
+    company_id = current_user.get("company_id")
+    update_data = {}
+    if company_id == deal["buyer_company_id"]:
+        update_data["buyer_signed"] = True
+        update_data["buyer_signed_at"] = datetime.now(timezone.utc).isoformat()
+        update_data["buyer_signed_by"] = current_user["full_name"]
+    elif company_id == deal["seller_company_id"]:
+        update_data["seller_signed"] = True
+        update_data["seller_signed_at"] = datetime.now(timezone.utc).isoformat()
+        update_data["seller_signed_by"] = current_user["full_name"]
+    else:
+        raise HTTPException(status_code=403, detail="Not authorized to sign this contract")
+    update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
+    await db.deals.update_one({"id": deal_id}, {"$set": update_data})
+    return {"success": True, "message": "Contract digitally signed"}
+
+
+# ============ THREAD LOCK ROUTES (F2) ============
+@api_router.post("/deals/{deal_id}/lock")
+async def lock_thread(deal_id: str, data: ThreadLockData, current_user=Depends(get_current_user)):
+    deal = await db.deals.find_one({"id": deal_id}, {"_id": 0})
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    company_id = current_user.get("company_id")
+    if company_id not in [deal["seller_company_id"], deal["buyer_company_id"]]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    await db.deals.update_one(
+        {"id": deal_id},
+        {"$set": {
+            "thread_locked": True,
+            "lock_reason": data.reason,
+            "locked_at": datetime.now(timezone.utc).isoformat(),
+            "locked_by": current_user["full_name"]
+        }}
+    )
+    await db.negotiation_messages.insert_one({
+        "id": str(uuid.uuid4()),
+        "deal_id": deal_id,
+        "sender_id": current_user["id"],
+        "sender_name": current_user["full_name"],
+        "sender_role": current_user["role"],
+        "message_type": "system",
+        "amount": None,
+        "message": f"Thread LOCKED by {current_user['full_name']}: {data.reason}",
+        "is_accepted": False,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    return {"success": True}
+
+
+@api_router.post("/deals/{deal_id}/unlock")
+async def unlock_thread(deal_id: str, current_user=Depends(get_current_user)):
+    deal = await db.deals.find_one({"id": deal_id}, {"_id": 0})
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    company_id = current_user.get("company_id")
+    if company_id not in [deal["seller_company_id"], deal["buyer_company_id"]]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    await db.deals.update_one({"id": deal_id}, {"$set": {"thread_locked": False}})
+    return {"success": True}
+
+
+# ============ BENCHMARK ROUTES (F3) ============
+@api_router.get("/benchmarks")
+async def get_benchmarks(area: Optional[str] = None, current_user=Depends(get_current_user)):
+    query = {"status": {"$in": ["paid", "active", "completed"]}}
+    if area:
+        query["billboard_address"] = {"$regex": area, "$options": "i"}
+    deals = await db.deals.find(query, {"_id": 0, "final_price": 1, "billboard_address": 1, "created_at": 1}).to_list(500)
+    prices = [d["final_price"] for d in deals if d.get("final_price")]
+    area_lower = area.lower() if area else ""
+    hardcoded = next(
+        (v for k, v in HARDCODED_BENCHMARKS.items() if area_lower and k in area_lower),
+        HARDCODED_BENCHMARKS["default"]
+    )
+    return {
+        "area": area or "All Hyderabad",
+        "data_points": len(prices),
+        "avg_price": round(sum(prices) / len(prices)) if prices else None,
+        "min_price": min(prices) if prices else hardcoded["min"],
+        "max_price": max(prices) if prices else hardcoded["max"],
+        "hardcoded_range": hardcoded,
+        "all_benchmarks": HARDCODED_BENCHMARKS
+    }
+
+
+# ============ REP PERFORMANCE ROUTES (F4) ============
+@api_router.get("/reps/my-performance")
+async def get_my_performance(current_user=Depends(get_current_user)):
+    user_id = current_user["id"]
+    deals = await db.deals.find({"rep_id": user_id}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    completed = [d for d in deals if d["status"] in ["paid", "completed"]]
+    total_commission = sum(d.get("commission_breakdown", {}).get("rep_commission", 0) or 0 for d in completed)
+    total_deal_value = sum(d.get("final_price", 0) or 0 for d in completed)
+    return {
+        "user_id": user_id,
+        "full_name": current_user["full_name"],
+        "email": current_user["email"],
+        "is_active": current_user.get("is_active", True),
+        "price_band_min": current_user.get("price_band_min"),
+        "price_band_max": current_user.get("price_band_max"),
+        "budget_ceiling": current_user.get("budget_ceiling"),
+        "total_deals": len(deals),
+        "completed_deals": len(completed),
+        "active_deals": len([d for d in deals if d["status"] in ["negotiating", "pending_approval"]]),
+        "win_rate": round(len(completed) / len(deals) * 100, 1) if deals else 0,
+        "total_commission_earned": total_commission,
+        "total_deal_value": total_deal_value,
+        "avg_deal_value": round(total_deal_value / len(completed)) if completed else 0,
+        "recent_deals": deals[:10]
+    }
+
+
+@api_router.get("/reps/{rep_id}/performance")
+async def get_rep_performance(rep_id: str, current_user=Depends(get_current_user)):
+    company_id = current_user.get("company_id")
+    rep = await db.users.find_one({"id": rep_id}, {"_id": 0, "password_hash": 0})
+    if not rep:
+        raise HTTPException(status_code=404, detail="Rep not found")
+    is_own = (rep_id == current_user["id"])
+    is_manager = (rep.get("company_id") == company_id and current_user["role"] != "rep")
+    if not (is_own or is_manager):
+        raise HTTPException(status_code=403, detail="Access denied")
+    deals = await db.deals.find({"rep_id": rep_id}, {"_id": 0}).sort("created_at", -1).to_list(500)
+    completed = [d for d in deals if d["status"] in ["paid", "completed"]]
+    total_commission = sum(d.get("commission_breakdown", {}).get("rep_commission", 0) or 0 for d in completed)
+    total_deal_value = sum(d.get("final_price", 0) or 0 for d in completed)
+    return {
+        "user_id": rep_id,
+        "full_name": rep["full_name"],
+        "email": rep["email"],
+        "phone": rep.get("phone"),
+        "is_active": rep.get("is_active", True),
+        "price_band_min": rep.get("price_band_min"),
+        "price_band_max": rep.get("price_band_max"),
+        "budget_ceiling": rep.get("budget_ceiling"),
+        "deal_approval_mode": rep.get("deal_approval_mode", "auto"),
+        "total_deals": len(deals),
+        "completed_deals": len(completed),
+        "active_deals": len([d for d in deals if d["status"] in ["negotiating", "pending_approval"]]),
+        "win_rate": round(len(completed) / len(deals) * 100, 1) if deals else 0,
+        "total_commission_earned": total_commission,
+        "total_deal_value": total_deal_value,
+        "avg_deal_value": round(total_deal_value / len(completed)) if completed else 0,
+        "recent_deals": deals[:5]
+    }
+
+
+# ============ AVAILABILITY ROUTES (F7) ============
+@api_router.get("/billboards/{billboard_id}/availability")
+async def get_availability(billboard_id: str, current_user=Depends(get_current_user)):
+    billboard = await db.billboards.find_one({"id": billboard_id}, {"_id": 0})
+    if not billboard:
+        raise HTTPException(status_code=404, detail="Billboard not found")
+    deals = await db.deals.find(
+        {"billboard_id": billboard_id, "status": {"$in": ["approved", "paid", "active"]}},
+        {"_id": 0, "booking_start_date": 1, "booking_end_date": 1, "status": 1}
+    ).to_list(100)
+    return {
+        "billboard_id": billboard_id,
+        "available_from": billboard.get("available_from"),
+        "current_status": billboard["status"],
+        "booked_ranges": [
+            {"start": d["booking_start_date"], "end": d["booking_end_date"], "status": d["status"]}
+            for d in deals
+        ]
+    }
+
+
+# ============ CAMPAIGN ROUTES (F6) ============
+@api_router.post("/campaigns")
+async def create_campaign(data: CampaignCreate, current_user=Depends(get_current_user)):
+    if current_user["role"] not in ["brand_manager", "rep"]:
+        raise HTTPException(status_code=403, detail="Only brand teams can create campaigns")
+    company_id = current_user.get("company_id")
+    if not company_id:
+        raise HTTPException(status_code=400, detail="Complete company setup first")
+    campaign_id = str(uuid.uuid4())
+    campaign_doc = {
+        "id": campaign_id,
+        "name": data.name,
+        "description": data.description,
+        "billboard_ids": data.billboard_ids,
+        "campaign_start_date": data.campaign_start_date,
+        "campaign_end_date": data.campaign_end_date,
+        "total_budget": data.total_budget,
+        "buyer_company_id": company_id,
+        "created_by": current_user["id"],
+        "status": "active",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.campaigns.insert_one(campaign_doc)
+    campaign_doc.pop("_id", None)
+    return campaign_doc
+
+
+@api_router.get("/campaigns")
+async def get_campaigns(current_user=Depends(get_current_user)):
+    company_id = current_user.get("company_id")
+    if not company_id:
+        return []
+    campaigns = await db.campaigns.find({"buyer_company_id": company_id}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    return campaigns
+
+
+@api_router.get("/campaigns/{campaign_id}")
+async def get_campaign(campaign_id: str, current_user=Depends(get_current_user)):
+    campaign = await db.campaigns.find_one({"id": campaign_id}, {"_id": 0})
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    company_id = current_user.get("company_id")
+    if campaign["buyer_company_id"] != company_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    billboards = []
+    for bid in campaign.get("billboard_ids", []):
+        bb = await db.billboards.find_one({"id": bid}, {"_id": 0, "min_acceptable_price": 0, "max_rep_discount_percent": 0})
+        if bb:
+            billboards.append(bb)
+    deals = await db.deals.find(
+        {"billboard_id": {"$in": campaign.get("billboard_ids", [])}, "buyer_company_id": company_id},
+        {"_id": 0}
+    ).to_list(100)
+    return {**campaign, "billboards": billboards, "deals": deals}
+
+
+# ============ DISPUTE ROUTES (F5) ============
+@api_router.post("/deals/{deal_id}/dispute")
+async def raise_dispute(deal_id: str, data: DisputeCreate, current_user=Depends(get_current_user)):
+    deal = await db.deals.find_one({"id": deal_id}, {"_id": 0})
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    if deal["status"] not in ["paid", "active", "completed"]:
+        raise HTTPException(status_code=400, detail="Disputes can only be raised on paid/active deals")
+    company_id = current_user.get("company_id")
+    if company_id not in [deal["seller_company_id"], deal["buyer_company_id"]]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    if deal.get("has_dispute"):
+        raise HTTPException(status_code=400, detail="A dispute is already open for this deal")
+    dispute_id = str(uuid.uuid4())
+    dispute_doc = {
+        "id": dispute_id,
+        "deal_id": deal_id,
+        "raised_by": current_user["id"],
+        "raised_by_name": current_user["full_name"],
+        "raised_by_company": company_id,
+        "reason": data.reason,
+        "description": data.description,
+        "status": "open",
+        "resolution": None,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.disputes.insert_one(dispute_doc)
+    await db.deals.update_one({"id": deal_id}, {"$set": {"dispute_id": dispute_id, "has_dispute": True}})
+    await db.negotiation_messages.insert_one({
+        "id": str(uuid.uuid4()),
+        "deal_id": deal_id,
+        "sender_id": current_user["id"],
+        "sender_name": current_user["full_name"],
+        "sender_role": current_user["role"],
+        "message_type": "system",
+        "amount": None,
+        "message": f"DISPUTE RAISED by {current_user['full_name']}: {data.reason}. Escrow hold activated. ClearDeal team will review within 72 hours.",
+        "is_accepted": False,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    })
+    dispute_doc.pop("_id", None)
+    return dispute_doc
+
+
+@api_router.get("/deals/{deal_id}/dispute")
+async def get_deal_dispute(deal_id: str, current_user=Depends(get_current_user)):
+    deal = await db.deals.find_one({"id": deal_id}, {"_id": 0})
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    company_id = current_user.get("company_id")
+    if company_id not in [deal["seller_company_id"], deal["buyer_company_id"]]:
+        raise HTTPException(status_code=403, detail="Access denied")
+    dispute = await db.disputes.find_one({"deal_id": deal_id}, {"_id": 0})
+    if not dispute:
+        raise HTTPException(status_code=404, detail="No dispute found for this deal")
+    return dispute
+
+
+# ============ NOTIFICATION ROUTES (C) ============
+@api_router.get("/notifications")
+async def get_notifications(current_user=Depends(get_current_user)):
+    notifications = await db.notifications.find(
+        {"user_id": current_user["id"]}, {"_id": 0}
+    ).sort("created_at", -1).to_list(50)
+    unread_count = len([n for n in notifications if not n["is_read"]])
+    return {"notifications": notifications, "unread_count": unread_count}
+
+
+@api_router.post("/notifications/mark-read")
+async def mark_notification_read(data: dict, current_user=Depends(get_current_user)):
+    notif_id = data.get("notification_id")
+    if notif_id:
+        await db.notifications.update_one(
+            {"id": notif_id, "user_id": current_user["id"]},
+            {"$set": {"is_read": True}}
+        )
+    return {"success": True}
+
+
+@api_router.post("/notifications/mark-all-read")
+async def mark_all_notifications_read(current_user=Depends(get_current_user)):
+    await db.notifications.update_many(
+        {"user_id": current_user["id"]},
+        {"$set": {"is_read": True}}
+    )
+    return {"success": True}
 
 
 # ============ APP SETUP ============
