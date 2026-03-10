@@ -7,7 +7,7 @@ import { toast } from 'sonner';
 import {
   LayoutDashboard, TrendingUp, Building2, FileText, Plus, Search,
   CheckCircle, Clock, XCircle, Users, DollarSign, BarChart2, Shield,
-  ChevronRight, RefreshCw, Eye, AlertCircle
+  ChevronRight, RefreshCw, Eye, AlertCircle, Settings, Star, UserX, UserCheck
 } from 'lucide-react';
 
 const statusColors = {
@@ -77,6 +77,9 @@ const Dashboard = () => {
   const [inviteName, setInviteName] = useState('');
   const [inviting, setInviting] = useState(false);
   const [inviteLink, setInviteLink] = useState('');
+  const [reps, setReps] = useState([]);
+  const [editingRep, setEditingRep] = useState(null);
+  const [repSettings, setRepSettings] = useState({});
 
   useEffect(() => {
     loadData();
@@ -91,6 +94,10 @@ const Dashboard = () => {
       ]);
       setStats(statsRes.data);
       if (companyRes) setCompany(companyRes.data);
+      if (user?.company_id && user?.role !== 'rep') {
+        const repsRes = await api.get(`/companies/${user.company_id}/reps`).catch(() => ({ data: [] }));
+        setReps(repsRes.data);
+      }
     } catch (err) {
       toast.error('Failed to load dashboard');
     } finally {
@@ -112,6 +119,27 @@ const Dashboard = () => {
       toast.error(err.response?.data?.detail || 'Failed to invite rep');
     } finally {
       setInviting(false);
+    }
+  };
+
+  const updateRepSettings = async (repId) => {
+    try {
+      await api.put(`/companies/reps/${repId}/settings`, repSettings);
+      toast.success('Rep settings updated');
+      setEditingRep(null);
+      loadData();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to update settings');
+    }
+  };
+
+  const toggleRepActive = async (repId, isActive) => {
+    try {
+      await api.post(`/companies/reps/${repId}/${isActive ? 'deactivate' : 'activate'}`);
+      toast.success(`Rep ${isActive ? 'deactivated' : 'activated'}`);
+      loadData();
+    } catch (err) {
+      toast.error('Failed to update rep status');
     }
   };
 
@@ -267,6 +295,84 @@ const Dashboard = () => {
                           {b.status}
                         </span>
                       </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Rep Management */}
+            {reps.length > 0 && (
+              <div className="bg-white border border-slate-200 rounded-lg" data-testid="rep-management-section">
+                <div className="px-5 py-4 border-b border-slate-100">
+                  <h3 className="font-semibold text-slate-900" style={{ fontFamily: "'Public Sans', sans-serif" }}>Team Reps ({reps.length})</h3>
+                  <p className="text-xs text-slate-500 mt-0.5">Manage your negotiation reps and their settings</p>
+                </div>
+                <div className="divide-y divide-slate-50">
+                  {reps.map(rep => (
+                    <div key={rep.id} className="px-5 py-3" data-testid={`rep-row-${rep.id}`}>
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className="w-8 h-8 bg-slate-200 rounded-full flex items-center justify-center text-xs font-bold text-slate-600">
+                            {rep.full_name?.charAt(0)}
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <p className="text-sm font-medium text-slate-900">{rep.full_name}</p>
+                              {rep.verified_negotiator && (
+                                <span className="inline-flex items-center gap-0.5 bg-emerald-100 text-emerald-700 text-[10px] font-semibold px-1.5 py-0.5 rounded-full">
+                                  <Shield className="w-2.5 h-2.5" /> Verified
+                                </span>
+                              )}
+                              {!rep.is_active && <span className="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-red-100 text-red-600">Inactive</span>}
+                            </div>
+                            <p className="text-xs text-slate-500">{rep.email}</p>
+                            {rep.avg_rating && <div className="flex items-center gap-1 mt-0.5"><Star className="w-3 h-3 text-amber-400 fill-amber-400" /><span className="text-xs text-slate-600">{rep.avg_rating}</span></div>}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <Link to={`/rep-performance/${rep.id}`} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-md transition-colors duration-150" title="View Performance">
+                            <BarChart2 className="w-4 h-4" />
+                          </Link>
+                          <button onClick={() => { setEditingRep(editingRep === rep.id ? null : rep.id); setRepSettings({ price_band_min: rep.price_band_min || '', price_band_max: rep.price_band_max || '', budget_ceiling: rep.budget_ceiling || '' }); }}
+                            className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-md transition-colors duration-150" title="Settings">
+                            <Settings className="w-4 h-4" />
+                          </button>
+                          <button onClick={() => toggleRepActive(rep.id, rep.is_active !== false)}
+                            className={`p-1.5 rounded-md transition-colors duration-150 ${rep.is_active !== false ? 'text-slate-400 hover:text-red-600 hover:bg-red-50' : 'text-emerald-500 hover:bg-emerald-50'}`}
+                            title={rep.is_active !== false ? 'Deactivate' : 'Activate'}>
+                            {rep.is_active !== false ? <UserX className="w-4 h-4" /> : <UserCheck className="w-4 h-4" />}
+                          </button>
+                        </div>
+                      </div>
+                      {editingRep === rep.id && (
+                        <div className="mt-3 p-3 bg-slate-50 rounded-lg" data-testid={`rep-settings-${rep.id}`}>
+                          <div className="grid grid-cols-3 gap-2 mb-2">
+                            <div>
+                              <label className="block text-[10px] font-medium text-slate-500 mb-0.5">Min Price Band</label>
+                              <input type="number" placeholder="₹" value={repSettings.price_band_min}
+                                onChange={e => setRepSettings({ ...repSettings, price_band_min: e.target.value })}
+                                className="w-full h-7 px-2 rounded border border-slate-200 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-blue-500" />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-medium text-slate-500 mb-0.5">Max Price Band</label>
+                              <input type="number" placeholder="₹" value={repSettings.price_band_max}
+                                onChange={e => setRepSettings({ ...repSettings, price_band_max: e.target.value })}
+                                className="w-full h-7 px-2 rounded border border-slate-200 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-blue-500" />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-medium text-slate-500 mb-0.5">Budget Ceiling</label>
+                              <input type="number" placeholder="₹" value={repSettings.budget_ceiling}
+                                onChange={e => setRepSettings({ ...repSettings, budget_ceiling: e.target.value })}
+                                className="w-full h-7 px-2 rounded border border-slate-200 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-blue-500" />
+                            </div>
+                          </div>
+                          <button onClick={() => updateRepSettings(rep.id)} data-testid={`save-rep-settings-${rep.id}`}
+                            className="h-7 px-3 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded transition-colors duration-150">
+                            Save Settings
+                          </button>
+                        </div>
+                      )}
                     </div>
                   ))}
                 </div>

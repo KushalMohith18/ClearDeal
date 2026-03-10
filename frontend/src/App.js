@@ -12,6 +12,8 @@ import BillboardDetail from './pages/BillboardDetail';
 import CreateListing from './pages/CreateListing';
 import Negotiation from './pages/Negotiation';
 import InviteAccept from './pages/InviteAccept';
+import RepPerformance from './pages/RepPerformance';
+import Campaigns from './pages/Campaigns';
 
 import './App.css';
 
@@ -52,6 +54,9 @@ const AppRoutes = () => {
       <Route path="/billboards/new" element={<ProtectedRoute><CreateListing /></ProtectedRoute>} />
       <Route path="/billboards/:id" element={<ProtectedRoute><BillboardDetail /></ProtectedRoute>} />
       <Route path="/deals/:id" element={<ProtectedRoute><Negotiation /></ProtectedRoute>} />
+      <Route path="/rep-performance" element={<ProtectedRoute><RepPerformance /></ProtectedRoute>} />
+      <Route path="/rep-performance/:repId" element={<ProtectedRoute><RepPerformance /></ProtectedRoute>} />
+      <Route path="/campaigns" element={<ProtectedRoute><Campaigns /></ProtectedRoute>} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

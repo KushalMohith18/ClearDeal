@@ -6,7 +6,7 @@ import api from '../utils/api';
 import { toast } from 'sonner';
 import {
   MapPin, Maximize2, Zap, Sun, LayoutGrid, Calendar, Eye, ChevronLeft,
-  TrendingUp, Shield, AlertCircle, DollarSign, Clock
+  TrendingUp, Shield, AlertCircle, DollarSign, Clock, Flag, CalendarDays
 } from 'lucide-react';
 import { MapContainer, TileLayer, Marker } from 'react-leaflet';
 import L from 'leaflet';
@@ -143,12 +143,20 @@ const BillboardDetail = () => {
   const [loading, setLoading] = useState(true);
   const [showOfferModal, setShowOfferModal] = useState(false);
   const [activePhoto, setActivePhoto] = useState(0);
+  const [availability, setAvailability] = useState(null);
+  const [interestDate, setInterestDate] = useState('');
+  const [interestMsg, setInterestMsg] = useState('');
+  const [flagging, setFlagging] = useState(false);
 
   useEffect(() => {
     const load = async () => {
       try {
-        const res = await api.get(`/billboards/${id}`);
-        setBillboard(res.data);
+        const [bbRes, availRes] = await Promise.all([
+          api.get(`/billboards/${id}`),
+          api.get(`/billboards/${id}/availability`).catch(() => ({ data: null }))
+        ]);
+        setBillboard(bbRes.data);
+        setAvailability(availRes.data);
       } catch (err) {
         toast.error('Billboard not found');
         navigate('/browse');
@@ -171,6 +179,38 @@ const BillboardDetail = () => {
 
   const bench = getBenchmark(billboard.address);
   const canMakeOffer = ['rep', 'brand_manager'].includes(user?.role) && billboard.status === 'active';
+  const isOwner = user?.company_id === billboard.owner_company_id;
+  const benchMid = (bench.min + bench.max) / 2;
+  const priceDiffPct = benchMid > 0 ? Math.round(((billboard.base_monthly_rate - benchMid) / benchMid) * 100) : 0;
+
+  const flagInterest = async (e) => {
+    e.preventDefault();
+    if (!interestDate) { toast.error('Select a date'); return; }
+    setFlagging(true);
+    try {
+      await api.post(`/billboards/${id}/interest`, { interested_date: interestDate, message: interestMsg });
+      toast.success('Interest flagged! Owner notified.');
+      setInterestDate('');
+      setInterestMsg('');
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to flag interest');
+    } finally {
+      setFlagging(false);
+    }
+  };
+
+  const getBookedDates = () => {
+    if (!availability?.booked_ranges) return [];
+    const dates = [];
+    for (const range of availability.booked_ranges) {
+      const start = new Date(range.start);
+      const end = new Date(range.end);
+      for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+        dates.push(new Date(d));
+      }
+    }
+    return dates;
+  };
 
   return (
     <div className="min-h-screen bg-slate-50" data-testid="billboard-detail-page">
@@ -280,6 +320,75 @@ const BillboardDetail = () => {
                 </div>
               </div>
             )}
+
+            {/* Availability Calendar (F7) */}
+            <div className="bg-white border border-slate-200 rounded-lg p-5" data-testid="availability-calendar">
+              <div className="flex items-center gap-2 mb-4">
+                <CalendarDays className="w-5 h-5 text-blue-600" />
+                <h3 className="font-semibold text-slate-900 text-sm" style={{ fontFamily: "'Public Sans', sans-serif" }}>3-Month Availability</h3>
+              </div>
+              <div className="flex flex-wrap gap-2 mb-4">
+                {(() => {
+                  const booked = getBookedDates();
+                  const today = new Date();
+                  const months = [];
+                  for (let m = 0; m < 3; m++) {
+                    const monthDate = new Date(today.getFullYear(), today.getMonth() + m, 1);
+                    const monthName = monthDate.toLocaleString('en-IN', { month: 'long', year: 'numeric' });
+                    const daysInMonth = new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 0).getDate();
+                    const firstDay = monthDate.getDay();
+                    const days = [];
+                    for (let d = 1; d <= daysInMonth; d++) {
+                      const dateObj = new Date(monthDate.getFullYear(), monthDate.getMonth(), d);
+                      const isBooked = booked.some(bd => bd.toDateString() === dateObj.toDateString());
+                      const isPast = dateObj < new Date(today.getFullYear(), today.getMonth(), today.getDate());
+                      days.push({ day: d, isBooked, isPast, dateObj });
+                    }
+                    months.push({ monthName, days, firstDay });
+                  }
+                  return months.map((mo, mi) => (
+                    <div key={mi} className="flex-1 min-w-[200px]">
+                      <p className="text-xs font-semibold text-slate-700 mb-2 text-center">{mo.monthName}</p>
+                      <div className="grid grid-cols-7 gap-0.5 text-center">
+                        {['S','M','T','W','T','F','S'].map((d,i) => (
+                          <span key={i} className="text-[10px] text-slate-400 font-medium">{d}</span>
+                        ))}
+                        {Array(mo.firstDay).fill(null).map((_, i) => <span key={`e${i}`} />)}
+                        {mo.days.map(({ day, isBooked, isPast }) => (
+                          <span key={day} className={`text-xs py-0.5 rounded ${
+                            isBooked ? 'bg-red-100 text-red-600 font-semibold' :
+                            isPast ? 'text-slate-300' :
+                            'text-slate-700 hover:bg-blue-50'
+                          }`} title={isBooked ? 'Booked' : 'Available'}>
+                            {day}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ));
+                })()}
+              </div>
+              <div className="flex items-center gap-4 text-xs text-slate-500 mb-4 border-t border-slate-100 pt-3">
+                <span className="flex items-center gap-1"><span className="w-3 h-3 bg-red-100 rounded" /> Booked</span>
+                <span className="flex items-center gap-1"><span className="w-3 h-3 bg-white border border-slate-200 rounded" /> Available</span>
+              </div>
+
+              {/* Interest Flagging for brand managers/reps */}
+              {canMakeOffer && (
+                <form onSubmit={flagInterest} className="border-t border-slate-100 pt-3">
+                  <p className="text-xs font-semibold text-slate-700 mb-2 flex items-center gap-1"><Flag className="w-3 h-3" /> Flag Interest in Future Date</p>
+                  <div className="flex gap-2">
+                    <input type="date" value={interestDate} onChange={e => setInterestDate(e.target.value)}
+                      data-testid="interest-date-input" required
+                      className="flex-1 h-8 px-3 rounded-md border border-slate-200 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent" />
+                    <button type="submit" disabled={flagging} data-testid="flag-interest-btn"
+                      className="h-8 px-3 bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white text-xs font-medium rounded-md transition-colors duration-150">
+                      {flagging ? '...' : 'Notify Owner'}
+                    </button>
+                  </div>
+                </form>
+              )}
+            </div>
           </div>
 
           {/* Sidebar */}
@@ -295,13 +404,20 @@ const BillboardDetail = () => {
               </div>
 
               {/* Benchmark */}
-              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 mb-4">
+              <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 mb-4" data-testid="benchmark-card">
                 <div className="flex items-center gap-2 mb-2">
                   <TrendingUp className="w-4 h-4 text-blue-600" />
                   <span className="text-xs font-semibold text-slate-700">Area Benchmark Price</span>
                 </div>
                 <p className="text-sm font-bold text-blue-600">{fmt(bench.min)} – {fmt(bench.max)}</p>
                 <p className="text-xs text-slate-500">Similar boards in this area</p>
+                {isOwner && priceDiffPct !== 0 && (
+                  <div className={`mt-2 text-xs font-semibold px-2 py-1 rounded ${
+                    priceDiffPct > 0 ? 'bg-amber-50 text-amber-700' : 'bg-emerald-50 text-emerald-700'
+                  }`} data-testid="owner-price-insight">
+                    Your board is {Math.abs(priceDiffPct)}% {priceDiffPct > 0 ? 'above' : 'below'} area average
+                  </div>
+                )}
               </div>
 
               <div className="space-y-2 mb-4 text-sm">

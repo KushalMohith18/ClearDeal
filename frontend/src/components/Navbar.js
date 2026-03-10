@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { Building2, LayoutDashboard, Search, Plus, LogOut, Menu, X, ChevronDown } from 'lucide-react';
+import { Building2, LayoutDashboard, Search, Plus, LogOut, Menu, X, ChevronDown, ShoppingCart, Trophy } from 'lucide-react';
 
 const Navbar = () => {
   const { user, logout } = useAuth();
@@ -20,6 +20,8 @@ const Navbar = () => {
     { to: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, roles: ['owner', 'brand_manager', 'rep'] },
     { to: '/browse', label: 'Browse', icon: Search, roles: ['brand_manager', 'rep'] },
     { to: '/billboards/new', label: 'New Listing', icon: Plus, roles: ['owner'] },
+    { to: '/campaigns', label: 'Campaigns', icon: ShoppingCart, roles: ['brand_manager'] },
+    { to: '/rep-performance', label: 'My Stats', icon: Trophy, roles: ['rep'] },
   ].filter(link => link.roles.includes(user?.role));
 
   const roleLabel = {

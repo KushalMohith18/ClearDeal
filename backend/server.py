@@ -1345,6 +1345,134 @@ async def mark_all_notifications_read(current_user=Depends(get_current_user)):
     return {"success": True}
 
 
+# ============ REP RATING (F4 Enhancement) ============
+class RepRatingCreate(BaseModel):
+    rating: int
+    comment: Optional[str] = None
+
+
+class InterestFlagCreate(BaseModel):
+    interested_date: str
+    message: Optional[str] = None
+
+
+class BillboardUpdate(BaseModel):
+    title: Optional[str] = None
+    base_monthly_rate: Optional[float] = None
+    description: Optional[str] = None
+    early_bird_enabled: Optional[bool] = None
+    early_bird_discount_pct: Optional[float] = None
+
+
+@api_router.post("/reps/{rep_id}/rate")
+async def rate_rep(rep_id: str, data: RepRatingCreate, current_user=Depends(get_current_user)):
+    if current_user["role"] == "rep":
+        raise HTTPException(status_code=403, detail="Only managers can rate reps")
+    rep = await db.users.find_one({"id": rep_id, "role": "rep"})
+    if not rep:
+        raise HTTPException(status_code=404, detail="Rep not found")
+    rating_doc = {
+        "id": str(uuid.uuid4()),
+        "rep_id": rep_id,
+        "rated_by": current_user["id"],
+        "rated_by_name": current_user["full_name"],
+        "rating": max(1, min(5, data.rating)),
+        "comment": data.comment,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.rep_ratings.insert_one(rating_doc)
+    ratings = await db.rep_ratings.find({"rep_id": rep_id}, {"_id": 0, "rating": 1}).to_list(500)
+    avg = sum(r["rating"] for r in ratings) / len(ratings)
+    badge = avg >= 4.0 and len(ratings) >= 3
+    await db.users.update_one({"id": rep_id}, {"$set": {"avg_rating": round(avg, 1), "rating_count": len(ratings), "verified_negotiator": badge}})
+    rating_doc.pop("_id", None)
+    return {"success": True, "avg_rating": round(avg, 1), "rating_count": len(ratings)}
+
+
+@api_router.get("/reps/{rep_id}/ratings")
+async def get_rep_ratings(rep_id: str, current_user=Depends(get_current_user)):
+    ratings = await db.rep_ratings.find({"rep_id": rep_id}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    return ratings
+
+
+# ============ BILLBOARD INTEREST (F7 Enhancement) ============
+@api_router.post("/billboards/{billboard_id}/interest")
+async def flag_interest(billboard_id: str, data: InterestFlagCreate, current_user=Depends(get_current_user)):
+    billboard = await db.billboards.find_one({"id": billboard_id})
+    if not billboard:
+        raise HTTPException(status_code=404, detail="Billboard not found")
+    interest_doc = {
+        "id": str(uuid.uuid4()),
+        "billboard_id": billboard_id,
+        "user_id": current_user["id"],
+        "user_name": current_user["full_name"],
+        "company_id": current_user.get("company_id"),
+        "interested_date": data.interested_date,
+        "message": data.message,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.interests.insert_one(interest_doc)
+    owner_users = await db.users.find({"company_id": billboard["owner_company_id"]}, {"_id": 0, "id": 1}).to_list(10)
+    for ou in owner_users:
+        await create_notification(ou["id"], "interest_flagged", "Interest in Your Billboard",
+            f"{current_user['full_name']} interested in {billboard['title']} for {data.interested_date}", None)
+    interest_doc.pop("_id", None)
+    return {"success": True, "message": "Interest flagged. Owner notified."}
+
+
+@api_router.get("/billboards/{billboard_id}/interests")
+async def get_billboard_interests(billboard_id: str, current_user=Depends(get_current_user)):
+    billboard = await db.billboards.find_one({"id": billboard_id})
+    if not billboard:
+        raise HTTPException(status_code=404, detail="Billboard not found")
+    if current_user.get("company_id") != billboard.get("owner_company_id"):
+        raise HTTPException(status_code=403, detail="Only billboard owner can view interests")
+    interests = await db.interests.find({"billboard_id": billboard_id}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    return interests
+
+
+# ============ BILLBOARD EDIT (PRD v2 US-03) ============
+@api_router.put("/billboards/{billboard_id}")
+async def update_billboard(billboard_id: str, data: BillboardUpdate, current_user=Depends(get_current_user)):
+    billboard = await db.billboards.find_one({"id": billboard_id})
+    if not billboard:
+        raise HTTPException(status_code=404, detail="Billboard not found")
+    if billboard["owner_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized")
+    update_fields = {k: v for k, v in data.model_dump().items() if v is not None}
+    if update_fields:
+        await db.billboards.update_one({"id": billboard_id}, {"$set": update_fields})
+    return {"success": True}
+
+
+# ============ ADMIN STATS ============
+@api_router.get("/admin/stats")
+async def get_admin_stats(current_user=Depends(get_current_user)):
+    total_users = await db.users.count_documents({})
+    total_companies = await db.companies.count_documents({})
+    total_billboards = await db.billboards.count_documents({})
+    total_deals = await db.deals.count_documents({})
+    active_deals = await db.deals.count_documents({"status": {"$in": ["negotiating", "pending_approval", "approved"]}})
+    completed_deals = await db.deals.count_documents({"status": {"$in": ["paid", "active", "completed"]}})
+    total_disputes = await db.disputes.count_documents({})
+    paid_deals = await db.deals.find(
+        {"status": {"$in": ["paid", "active", "completed"]}},
+        {"_id": 0, "final_price": 1, "commission_breakdown": 1}
+    ).to_list(500)
+    total_gmv = sum(d.get("final_price", 0) or 0 for d in paid_deals)
+    platform_revenue = sum(d.get("commission_breakdown", {}).get("platform_commission", 0) or 0 for d in paid_deals)
+    recent_deals = await db.deals.find({}, {"_id": 0}).sort("created_at", -1).to_list(10)
+    recent_users = await db.users.find({}, {"_id": 0, "password_hash": 0}).sort("created_at", -1).to_list(10)
+    return {
+        "total_users": total_users, "total_companies": total_companies,
+        "total_billboards": total_billboards, "total_deals": total_deals,
+        "active_deals": active_deals, "completed_deals": completed_deals,
+        "total_disputes": total_disputes, "total_gmv": total_gmv,
+        "platform_revenue": platform_revenue, "recent_deals": recent_deals,
+        "recent_users": recent_users
+    }
+
+
 # ============ APP SETUP ============
 app.include_router(api_router)
 

@@ -6,7 +6,8 @@ import api from '../utils/api';
 import { toast } from 'sonner';
 import {
   Send, CheckCircle, X, DollarSign, Clock, Shield, FileText,
-  ChevronLeft, AlertCircle, CreditCard, Download, RefreshCw
+  ChevronLeft, AlertCircle, CreditCard, Download, RefreshCw,
+  Lock, Unlock, AlertTriangle, PenTool
 } from 'lucide-react';
 
 const fmt = (n) => n ? `₹${Number(n).toLocaleString('en-IN')}` : '—';
@@ -97,6 +98,10 @@ const Negotiation = () => {
   const [msgText, setMsgText] = useState('');
   const [offerAmount, setOfferAmount] = useState('');
   const [invoice, setInvoice] = useState(null);
+  const [contract, setContract] = useState(null);
+  const [dispute, setDispute] = useState(null);
+  const [disputeForm, setDisputeForm] = useState({ reason: '', description: '' });
+  const [showDisputeForm, setShowDisputeForm] = useState(false);
   const messagesEndRef = useRef(null);
   const pollRef = useRef(null);
 
@@ -207,6 +212,67 @@ const Negotiation = () => {
     }
   };
 
+  const loadContract = async () => {
+    try {
+      const res = await api.get(`/deals/${dealId}/contract`);
+      setContract(res.data);
+    } catch (err) {
+      toast.error('Contract not available yet');
+    }
+  };
+
+  const signContract = async () => {
+    try {
+      await api.post(`/deals/${dealId}/sign`);
+      toast.success('Contract signed');
+      await loadContract();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to sign');
+    }
+  };
+
+  const raiseDispute = async (e) => {
+    e.preventDefault();
+    try {
+      const res = await api.post(`/deals/${dealId}/dispute`, disputeForm);
+      toast.success('Dispute raised. Escrow hold activated.');
+      setDispute(res.data);
+      setShowDisputeForm(false);
+      await loadDeal();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to raise dispute');
+    }
+  };
+
+  const loadDispute = async () => {
+    try {
+      const res = await api.get(`/deals/${dealId}/dispute`);
+      setDispute(res.data);
+    } catch (err) {
+      // No dispute exists
+    }
+  };
+
+  const lockThread = async () => {
+    try {
+      await api.post(`/deals/${dealId}/lock`, { reason: 'Thread locked by manager' });
+      toast.success('Thread locked');
+      await loadDeal();
+    } catch (err) {
+      toast.error(err.response?.data?.detail || 'Failed to lock');
+    }
+  };
+
+  const unlockThread = async () => {
+    try {
+      await api.post(`/deals/${dealId}/unlock`);
+      toast.success('Thread unlocked');
+      await loadDeal();
+    } catch (err) {
+      toast.error('Failed to unlock');
+    }
+  };
+
   if (loading) return (
     <div className="min-h-screen bg-slate-50"><Navbar />
       <div className="flex items-center justify-center py-20">
@@ -225,6 +291,9 @@ const Negotiation = () => {
   );
   const canPay = deal.status === 'approved' && isBuyerParty && user?.role !== 'rep';
   const canNegotiate = deal.status === 'negotiating';
+  const canLockThread = ['owner', 'brand_manager'].includes(user?.role) && (isSellerParty || isBuyerParty);
+  const canRaiseDispute = ['paid', 'active'].includes(deal.status) && (isSellerParty || isBuyerParty) && !deal.has_dispute;
+  const showContract = ['pending_approval', 'approved', 'paid', 'active', 'completed'].includes(deal.status);
 
   return (
     <div className="min-h-screen bg-slate-50" data-testid="negotiation-page">
@@ -244,6 +313,11 @@ const Negotiation = () => {
           <span className={`text-xs font-semibold px-3 py-1.5 rounded-full border ${statusColors[deal.status] || 'bg-slate-100 text-slate-600'}`} data-testid="deal-status-badge">
             {statusLabels[deal.status] || deal.status}
           </span>
+          {deal.thread_locked && (
+            <span className="text-xs font-semibold px-2.5 py-1 rounded-full bg-amber-100 text-amber-700 border border-amber-200 flex items-center gap-1" data-testid="thread-locked-badge">
+              <Lock className="w-3 h-3" /> Locked
+            </span>
+          )}
           <button onClick={loadDeal} className="p-1.5 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-md transition-colors duration-150">
             <RefreshCw className="w-4 h-4" />
           </button>
@@ -499,6 +573,141 @@ const Negotiation = () => {
                     <p className="text-slate-400 text-center pt-1">GST Invoice per CGST Act Section 31</p>
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* Contract (F1) */}
+            {showContract && (
+              <div className="bg-white border border-slate-200 rounded-lg p-5" data-testid="contract-panel">
+                <h3 className="font-semibold text-slate-900 mb-3" style={{ fontFamily: "'Public Sans', sans-serif" }}>Deal Contract</h3>
+                {!contract ? (
+                  <button onClick={loadContract} data-testid="view-contract-btn"
+                    className="w-full h-9 bg-white border border-slate-200 hover:border-slate-300 text-slate-700 text-sm font-medium rounded-md transition-colors duration-150 flex items-center justify-center gap-2">
+                    <PenTool className="w-4 h-4" /> View Contract
+                  </button>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs space-y-2">
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Contract No.</span>
+                        <span className="font-mono font-semibold">{contract.contract_number}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Buyer Org</span>
+                        <span className="font-medium">{contract.buyer?.name}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Seller Org</span>
+                        <span className="font-medium">{contract.seller?.name}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Board</span>
+                        <span className="font-medium">{contract.billboard?.title}</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Agreed Price</span>
+                        <span className="font-bold">{fmt(contract.deal?.final_price)}/mo</span>
+                      </div>
+                      <div className="flex justify-between">
+                        <span className="text-slate-500">Period</span>
+                        <span>{contract.deal?.booking_start_date} → {contract.deal?.booking_end_date}</span>
+                      </div>
+                    </div>
+                    <div className="space-y-1.5">
+                      <div className={`flex items-center gap-2 text-xs ${deal.buyer_signed ? 'text-emerald-600' : 'text-slate-500'}`}>
+                        {deal.buyer_signed ? <CheckCircle className="w-3.5 h-3.5" /> : <Clock className="w-3.5 h-3.5" />}
+                        Buyer: {deal.buyer_signed ? `Signed by ${deal.buyer_signed_by}` : 'Pending signature'}
+                      </div>
+                      <div className={`flex items-center gap-2 text-xs ${deal.seller_signed ? 'text-emerald-600' : 'text-slate-500'}`}>
+                        {deal.seller_signed ? <CheckCircle className="w-3.5 h-3.5" /> : <Clock className="w-3.5 h-3.5" />}
+                        Seller: {deal.seller_signed ? `Signed by ${deal.seller_signed_by}` : 'Pending signature'}
+                      </div>
+                    </div>
+                    {user?.role !== 'rep' && (
+                      (isSellerParty && !deal.seller_signed) || (isBuyerParty && !deal.buyer_signed)
+                    ) && (
+                      <button onClick={signContract} data-testid="sign-contract-btn"
+                        className="w-full h-9 bg-slate-900 hover:bg-slate-800 text-white text-sm font-semibold rounded-md transition-colors duration-150 flex items-center justify-center gap-2">
+                        <PenTool className="w-4 h-4" /> Sign Contract (OTP Simulated)
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Thread Lock (F2) */}
+            {canLockThread && deal.status === 'negotiating' && (
+              <div className="bg-white border border-slate-200 rounded-lg p-5" data-testid="thread-lock-panel">
+                <h3 className="font-semibold text-slate-900 mb-3" style={{ fontFamily: "'Public Sans', sans-serif" }}>Thread Control</h3>
+                {deal.thread_locked ? (
+                  <div>
+                    <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 mb-3">
+                      <div className="flex items-center gap-2 text-amber-700 text-xs font-semibold mb-1">
+                        <Lock className="w-3.5 h-3.5" /> Thread Locked
+                      </div>
+                      <p className="text-xs text-amber-600">{deal.lock_reason}</p>
+                      <p className="text-xs text-amber-500 mt-1">Locked by {deal.locked_by}</p>
+                    </div>
+                    <button onClick={unlockThread} data-testid="unlock-thread-btn"
+                      className="w-full h-9 bg-white border border-slate-200 hover:border-slate-300 text-slate-700 text-sm font-medium rounded-md transition-colors duration-150 flex items-center justify-center gap-2">
+                      <Unlock className="w-4 h-4" /> Unlock Thread
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    <p className="text-xs text-slate-500 mb-3">Lock this thread to prevent further negotiation. Both parties can only transact on-platform for 30 days.</p>
+                    <button onClick={lockThread} data-testid="lock-thread-btn"
+                      className="w-full h-9 bg-amber-500 hover:bg-amber-600 text-white text-sm font-medium rounded-md transition-colors duration-150 flex items-center justify-center gap-2">
+                      <Lock className="w-4 h-4" /> Lock Thread
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Dispute (F5) */}
+            {canRaiseDispute && (
+              <div className="bg-white border border-slate-200 rounded-lg p-5" data-testid="dispute-panel">
+                <h3 className="font-semibold text-slate-900 mb-3" style={{ fontFamily: "'Public Sans', sans-serif" }}>Dispute Resolution</h3>
+                {!showDisputeForm ? (
+                  <div>
+                    <p className="text-xs text-slate-500 mb-3">Raise a dispute within 7 days of deal start. Escrow will be held pending review.</p>
+                    <button onClick={() => setShowDisputeForm(true)} data-testid="raise-dispute-btn"
+                      className="w-full h-9 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-md transition-colors duration-150 flex items-center justify-center gap-2">
+                      <AlertTriangle className="w-4 h-4" /> Raise Dispute
+                    </button>
+                  </div>
+                ) : (
+                  <form onSubmit={raiseDispute} className="space-y-3">
+                    <input type="text" required placeholder="Reason (e.g., Board damaged)" value={disputeForm.reason}
+                      onChange={e => setDisputeForm({ ...disputeForm, reason: e.target.value })}
+                      data-testid="dispute-reason-input"
+                      className="w-full h-9 px-3 rounded-md border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent" />
+                    <textarea required placeholder="Describe the issue in detail..." value={disputeForm.description}
+                      onChange={e => setDisputeForm({ ...disputeForm, description: e.target.value })}
+                      data-testid="dispute-description-input" rows={3}
+                      className="w-full px-3 py-2 rounded-md border border-slate-300 text-sm focus:outline-none focus:ring-2 focus:ring-red-500 focus:border-transparent resize-none" />
+                    <div className="flex gap-2">
+                      <button type="submit" data-testid="submit-dispute-btn"
+                        className="flex-1 h-9 bg-red-600 hover:bg-red-700 text-white text-sm font-medium rounded-md transition-colors duration-150">
+                        Submit Dispute
+                      </button>
+                      <button type="button" onClick={() => setShowDisputeForm(false)}
+                        className="px-3 h-9 border border-slate-200 text-slate-600 rounded-md text-sm hover:bg-slate-50 transition-colors duration-150">
+                        Cancel
+                      </button>
+                    </div>
+                  </form>
+                )}
+              </div>
+            )}
+            {deal.has_dispute && (
+              <div className="bg-red-50 border border-red-200 rounded-lg p-4" data-testid="dispute-active">
+                <div className="flex items-center gap-2 text-red-700 text-xs font-semibold mb-1">
+                  <AlertTriangle className="w-3.5 h-3.5" /> Dispute Active
+                </div>
+                <p className="text-xs text-red-600">Escrow held. ClearDeal team reviewing within 72 hours.</p>
               </div>
             )}
           </div>
