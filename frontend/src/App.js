@@ -1,53 +1,70 @@
-import { useEffect } from "react";
-import "@/App.css";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
-import axios from "axios";
+import React from 'react';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { AuthProvider, useAuth } from './contexts/AuthContext';
+import { Toaster } from './components/ui/sonner';
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-const API = `${BACKEND_URL}/api`;
+import Landing from './pages/Landing';
+import Auth from './pages/Auth';
+import Onboarding from './pages/Onboarding';
+import Dashboard from './pages/Dashboard';
+import BillboardBrowse from './pages/BillboardBrowse';
+import BillboardDetail from './pages/BillboardDetail';
+import CreateListing from './pages/CreateListing';
+import Negotiation from './pages/Negotiation';
+import InviteAccept from './pages/InviteAccept';
 
-const Home = () => {
-  const helloWorldApi = async () => {
-    try {
-      const response = await axios.get(`${API}/`);
-      console.log(response.data.message);
-    } catch (e) {
-      console.error(e, `errored out requesting / api`);
-    }
-  };
+import './App.css';
 
-  useEffect(() => {
-    helloWorldApi();
-  }, []);
+const ProtectedRoute = ({ children }) => {
+  const { user, loading } = useAuth();
+  if (loading) return (
+    <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+      <div className="text-center">
+        <div className="w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-3"></div>
+        <p className="text-slate-500 text-sm">Loading ClearDeal...</p>
+      </div>
+    </div>
+  );
+  if (!user) return <Navigate to="/auth" replace />;
+  return children;
+};
+
+const AppRoutes = () => {
+  const { user, loading } = useAuth();
+
+  if (loading) return (
+    <div className="min-h-screen bg-slate-50 flex items-center justify-center">
+      <div className="text-center">
+        <div className="w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full animate-spin mx-auto mb-3"></div>
+        <p className="text-slate-500 text-sm">Loading ClearDeal...</p>
+      </div>
+    </div>
+  );
 
   return (
-    <div>
-      <header className="App-header">
-        <a
-          className="App-link"
-          href="https://emergent.sh"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <img src="https://avatars.githubusercontent.com/in/1201222?s=120&u=2686cf91179bbafbc7a71bfbc43004cf9ae1acea&v=4" />
-        </a>
-        <p className="mt-5">Building something incredible ~!</p>
-      </header>
-    </div>
+    <Routes>
+      <Route path="/" element={user ? <Navigate to="/dashboard" replace /> : <Landing />} />
+      <Route path="/auth" element={user ? <Navigate to={user.company_id ? "/dashboard" : "/onboarding"} replace /> : <Auth />} />
+      <Route path="/invite/:inviteId" element={<InviteAccept />} />
+      <Route path="/onboarding" element={<ProtectedRoute><Onboarding /></ProtectedRoute>} />
+      <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
+      <Route path="/browse" element={<ProtectedRoute><BillboardBrowse /></ProtectedRoute>} />
+      <Route path="/billboards/new" element={<ProtectedRoute><CreateListing /></ProtectedRoute>} />
+      <Route path="/billboards/:id" element={<ProtectedRoute><BillboardDetail /></ProtectedRoute>} />
+      <Route path="/deals/:id" element={<ProtectedRoute><Negotiation /></ProtectedRoute>} />
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
   );
 };
 
 function App() {
   return (
-    <div className="App">
+    <AuthProvider>
       <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<Home />}>
-            <Route index element={<Home />} />
-          </Route>
-        </Routes>
+        <AppRoutes />
+        <Toaster position="top-right" />
       </BrowserRouter>
-    </div>
+    </AuthProvider>
   );
 }
 
