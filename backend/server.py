@@ -1,27 +1,84 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, status
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field, EmailStr, ConfigDict
-from typing import List, Optional, Any
+from pydantic import BaseModel, Field, EmailStr, ConfigDict, field_validator
+from typing import List, Optional, Any, Dict
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+from contextlib import asynccontextmanager
 import os
 import logging
 import uuid
+import re
+import traceback
 from pathlib import Path
+
+# Import custom exceptions
+from exceptions import (
+    ClearDealException, AuthenticationError, AuthorizationError,
+    ResourceNotFoundError, ValidationError as CustomValidationError,
+    BusinessLogicError, PriceBandViolationError, DealStateError,
+    CompanyRequiredError, DatabaseError, ExternalServiceError,
+    ErrorCode, cleardeal_exception_handler, generic_exception_handler
+)
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(ROOT_DIR / 'cleardeal.log', mode='a')
+    ]
+)
+logger = logging.getLogger("cleardeal")
 
-app = FastAPI()
+# Database connection with error handling
+try:
+    mongo_url = os.environ.get('MONGO_URL')
+    if not mongo_url:
+        raise ValueError("MONGO_URL environment variable is not set")
+    client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
+    db_name = os.environ.get('DB_NAME', 'cleardeal')
+    db = client[db_name]
+    logger.info(f"MongoDB connection configured for database: {db_name}")
+except Exception as e:
+    logger.critical(f"Failed to configure MongoDB connection: {e}")
+    raise
+
+# Lifespan context manager for startup/shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    try:
+        await client.admin.command('ping')
+        logger.info("MongoDB connection verified successfully")
+    except Exception as e:
+        logger.error(f"MongoDB connection verification failed: {e}")
+    yield
+    # Shutdown
+    client.close()
+    logger.info("MongoDB connection closed")
+
+app = FastAPI(
+    title="ClearDeal API",
+    description="B2B Billboard Advertising Transparency Platform API",
+    version="2.0.0",
+    lifespan=lifespan
+)
+
+# Register custom exception handlers
+app.add_exception_handler(ClearDealException, cleardeal_exception_handler)
+app.add_exception_handler(Exception, generic_exception_handler)
+
 api_router = APIRouter(prefix="/api")
 
 SECRET_KEY = os.environ.get('JWT_SECRET', 'cleardeal-jwt-secret-key-2024')
@@ -30,8 +87,6 @@ TOKEN_EXPIRE_HOURS = 24 * 7
 
 security = HTTPBearer()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 
 # ============ ENUMS ============
@@ -171,7 +226,11 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    try:
+        return pwd_context.verify(plain, hashed)
+    except Exception as e:
+        logger.error(f"Password verification error: {e}")
+        return False
 
 
 def create_token(user_id: str) -> str:
@@ -180,16 +239,44 @@ def create_token(user_id: str) -> str:
 
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Get current authenticated user with proper error handling"""
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
         if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid token")
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    user = await db.users.find_one({"id": user_id}, {"_id": 0})
+            raise AuthenticationError(
+                error_code=ErrorCode.AUTH_TOKEN_INVALID,
+                message="Invalid token: missing user identifier"
+            )
+    except jwt.ExpiredSignatureError:
+        raise AuthenticationError(
+            error_code=ErrorCode.AUTH_TOKEN_EXPIRED,
+            message="Your session has expired. Please log in again."
+        )
+    except JWTError as e:
+        logger.warning(f"JWT decode error: {e}")
+        raise AuthenticationError(
+            error_code=ErrorCode.AUTH_TOKEN_INVALID,
+            message="Invalid or malformed authentication token"
+        )
+    
+    try:
+        user = await db.users.find_one({"id": user_id}, {"_id": 0})
+    except Exception as e:
+        logger.error(f"Database error fetching user: {e}")
+        raise DatabaseError(message="Failed to retrieve user information")
+    
     if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise AuthenticationError(
+            error_code=ErrorCode.AUTH_TOKEN_INVALID,
+            message="User account not found"
+        )
+    
+    if not user.get("is_active", True):
+        raise AuthorizationError(
+            message="Your account has been deactivated. Please contact your organization manager."
+        )
+    
     return user
 
 
@@ -212,282 +299,571 @@ HARDCODED_BENCHMARKS = {
 
 
 # ============ NOTIFICATION HELPER ============
-async def create_notification(user_id: str, notif_type: str, title: str, message: str, deal_id: Optional[str] = None):
+async def create_notification(
+    user_id: str,
+    notif_type: str,
+    title: str,
+    message: str,
+    deal_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None
+):
+    """Create a notification with error handling"""
     try:
-        await db.notifications.insert_one({
+        notification_doc = {
             "id": str(uuid.uuid4()),
             "user_id": user_id,
             "type": notif_type,
             "title": title,
             "message": message,
             "deal_id": deal_id,
+            "metadata": metadata or {},
             "is_read": False,
             "created_at": datetime.now(timezone.utc).isoformat()
-        })
+        }
+        await db.notifications.insert_one(notification_doc)
+        logger.debug(f"Notification created for user {user_id}: {title}")
     except Exception as e:
-        logger.error(f"Notification error: {e}")
+        # Log but don't fail the main operation
+        logger.error(f"Failed to create notification for user {user_id}: {e}")
+
+
+# ============ VALIDATION HELPERS ============
+def validate_email_format(email: str) -> str:
+    """Validate email format"""
+    email_pattern = re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+    if not email_pattern.match(email):
+        raise BusinessLogicError(
+            error_code=ErrorCode.VALIDATION_INVALID_FORMAT,
+            message="Invalid email format",
+            details={"field": "email", "value": email}
+        )
+    return email.lower()
+
+
+def validate_gst_format(gst: str) -> str:
+    """Validate Indian GST number format"""
+    gst_pattern = re.compile(r'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$')
+    if not gst_pattern.match(gst.upper()):
+        raise BusinessLogicError(
+            error_code=ErrorCode.VALIDATION_INVALID_FORMAT,
+            message="Invalid GST number format. Expected format: 36AABCU9603R1ZM",
+            details={"field": "gst_number", "value": gst}
+        )
+    return gst.upper()
+
+
+def validate_positive_amount(amount: float, field_name: str = "amount") -> float:
+    """Validate amount is positive"""
+    if amount <= 0:
+        raise BusinessLogicError(
+            error_code=ErrorCode.VALIDATION_OUT_OF_RANGE,
+            message=f"{field_name} must be a positive number",
+            details={"field": field_name, "value": amount, "constraint": "> 0"}
+        )
+    return amount
+
+
+def check_company_exists(user: dict, action: str = "perform this action") -> str:
+    """Check if user has a company and return company_id"""
+    company_id = user.get("company_id")
+    if not company_id:
+        raise CompanyRequiredError(action=action)
+    return company_id
 
 
 # ============ AUTH ROUTES ============
-@api_router.post("/auth/register")
+@api_router.post("/auth/register", tags=["Authentication"])
 async def register(data: UserCreate):
-    existing = await db.users.find_one({"email": data.email})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
+    """Register a new user account"""
+    try:
+        # Validate email format
+        email = validate_email_format(data.email)
+        
+        # Check for existing user
+        existing = await db.users.find_one({"email": email})
+        if existing:
+            raise BusinessLogicError(
+                error_code=ErrorCode.AUTH_EMAIL_EXISTS,
+                message="An account with this email already exists. Please log in or use a different email.",
+                details={"email": email}
+            )
 
-    user_id = str(uuid.uuid4())
-    user_doc = {
-        "id": user_id,
-        "email": data.email,
-        "password_hash": hash_password(data.password),
-        "full_name": data.full_name,
-        "phone": data.phone,
-        "role": data.role,
-        "company_id": None,
-        "is_active": True,
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.users.insert_one(user_doc)
-    token = create_token(user_id)
-    return {"token": token, "user": safe_user(user_doc)}
+        # Validate password strength
+        if len(data.password) < 6:
+            raise BusinessLogicError(
+                error_code=ErrorCode.VALIDATION_FAILED,
+                message="Password must be at least 6 characters long",
+                details={"field": "password", "min_length": 6}
+            )
+
+        user_id = str(uuid.uuid4())
+        user_doc = {
+            "id": user_id,
+            "email": email,
+            "password_hash": hash_password(data.password),
+            "full_name": data.full_name.strip(),
+            "phone": data.phone.strip(),
+            "role": data.role,
+            "company_id": None,
+            "is_active": True,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        await db.users.insert_one(user_doc)
+        token = create_token(user_id)
+        
+        logger.info(f"New user registered: {email} with role {data.role}")
+        return {"success": True, "token": token, "user": safe_user(user_doc)}
+        
+    except ClearDealException:
+        raise
+    except Exception as e:
+        logger.error(f"Registration error: {e}")
+        raise DatabaseError(message="Failed to create user account. Please try again.")
 
 
-@api_router.post("/auth/login")
+@api_router.post("/auth/login", tags=["Authentication"])
 async def login(data: UserLogin):
-    user = await db.users.find_one({"email": data.email}, {"_id": 0})
-    if not user or not verify_password(data.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
-    token = create_token(user["id"])
-    return {"token": token, "user": safe_user(user)}
+    """Authenticate user and return token"""
+    try:
+        email = data.email.lower()
+        user = await db.users.find_one({"email": email}, {"_id": 0})
+        
+        if not user:
+            raise AuthenticationError(
+                error_code=ErrorCode.AUTH_INVALID_CREDENTIALS,
+                message="Invalid email or password. Please check your credentials and try again."
+            )
+        
+        if not verify_password(data.password, user.get("password_hash", "")):
+            raise AuthenticationError(
+                error_code=ErrorCode.AUTH_INVALID_CREDENTIALS,
+                message="Invalid email or password. Please check your credentials and try again."
+            )
+        
+        if not user.get("is_active", True):
+            raise AuthorizationError(
+                message="Your account has been deactivated. Please contact your organization manager."
+            )
+        
+        token = create_token(user["id"])
+        logger.info(f"User logged in: {email}")
+        return {"success": True, "token": token, "user": safe_user(user)}
+        
+    except ClearDealException:
+        raise
+    except Exception as e:
+        logger.error(f"Login error: {e}")
+        raise DatabaseError(message="Authentication service temporarily unavailable. Please try again.")
 
 
-@api_router.get("/auth/me")
+@api_router.get("/auth/me", tags=["Authentication"])
 async def get_me(current_user=Depends(get_current_user)):
-    return safe_user(current_user)
+    """Get current user profile"""
+    return {"success": True, "user": safe_user(current_user)}
 
 
 # ============ COMPANY ROUTES ============
-@api_router.post("/companies")
+@api_router.post("/companies", tags=["Companies"])
 async def create_company(data: CompanyCreate, current_user=Depends(get_current_user)):
-    if current_user.get("company_id"):
-        raise HTTPException(status_code=400, detail="User already has a company")
+    """Create a new company/organization"""
+    try:
+        if current_user.get("company_id"):
+            raise BusinessLogicError(
+                error_code=ErrorCode.RESOURCE_ALREADY_EXISTS,
+                message="You already have a registered company. Each user can only belong to one organization.",
+                details={"existing_company_id": current_user.get("company_id")}
+            )
 
-    company_id = str(uuid.uuid4())
-    company_doc = {
-        "id": company_id,
-        "name": data.name,
-        "gst_number": data.gst_number,
-        "director_name": data.director_name,
-        "company_type": data.company_type,
-        "city": data.city,
-        "address": data.address,
-        "phone": data.phone,
-        "website": data.website,
-        "gst_verified": False,
-        "aadhaar_verified": False,
-        "bank_verified": False,
-        "bank_account": None,
-        "verified_badge": False,
-        "created_by": current_user["id"],
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.companies.insert_one(company_doc)
-    await db.users.update_one({"id": current_user["id"]}, {"$set": {"company_id": company_id}})
-    company_doc.pop("_id", None)
-    return company_doc
+        # Validate GST format
+        gst_number = validate_gst_format(data.gst_number)
 
-
-@api_router.get("/companies/me")
-async def get_my_company(current_user=Depends(get_current_user)):
-    if not current_user.get("company_id"):
-        raise HTTPException(status_code=404, detail="No company found")
-    company = await db.companies.find_one({"id": current_user["company_id"]}, {"_id": 0})
-    if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-    return company
-
-
-@api_router.post("/companies/verify-gst")
-async def verify_gst(current_user=Depends(get_current_user)):
-    company_id = current_user.get("company_id")
-    if not company_id:
-        raise HTTPException(status_code=400, detail="No company found")
-    await db.companies.update_one({"id": company_id}, {"$set": {"gst_verified": True}})
-    return {"success": True, "message": "GST verified successfully (simulated)"}
-
-
-@api_router.post("/companies/verify-aadhaar")
-async def verify_aadhaar(data: AadhaarVerifyData, current_user=Depends(get_current_user)):
-    company_id = current_user.get("company_id")
-    if not company_id:
-        raise HTTPException(status_code=400, detail="No company found")
-    await db.companies.update_one({"id": company_id}, {"$set": {"aadhaar_verified": True}})
-    return {"success": True, "message": "Aadhaar verified via DigiLocker (simulated)"}
-
-
-@api_router.post("/companies/verify-bank")
-async def verify_bank(data: BankVerifyData, current_user=Depends(get_current_user)):
-    company_id = current_user.get("company_id")
-    if not company_id:
-        raise HTTPException(status_code=400, detail="No company found")
-    await db.companies.update_one(
-        {"id": company_id},
-        {"$set": {
-            "bank_verified": True,
-            "bank_account": {
-                "account_number_masked": f"XXXX{data.account_number[-4:]}",
-                "ifsc_code": data.ifsc_code,
-                "account_holder_name": data.account_holder_name
-            },
-            "verified_badge": True
-        }}
-    )
-    return {"success": True, "message": "Bank account verified via penny-drop (simulated)"}
-
-
-@api_router.post("/companies/invite-rep")
-async def invite_rep(data: RepInvite, current_user=Depends(get_current_user)):
-    company_id = current_user.get("company_id")
-    if not company_id:
-        raise HTTPException(status_code=400, detail="No company found")
-
-    existing_user = await db.users.find_one({"email": data.email})
-    if existing_user:
+        company_id = str(uuid.uuid4())
+        company_doc = {
+            "id": company_id,
+            "name": data.name.strip(),
+            "gst_number": gst_number,
+            "director_name": data.director_name.strip(),
+            "company_type": data.company_type,
+            "city": data.city,
+            "address": data.address.strip(),
+            "phone": data.phone.strip(),
+            "website": data.website,
+            "gst_verified": False,
+            "aadhaar_verified": False,
+            "bank_verified": False,
+            "bank_account": None,
+            "verified_badge": False,
+            "created_by": current_user["id"],
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        await db.companies.insert_one(company_doc)
         await db.users.update_one(
-            {"email": data.email},
-            {"$set": {"company_id": company_id, "role": "rep"}}
+            {"id": current_user["id"]},
+            {"$set": {"company_id": company_id}}
         )
-        return {"success": True, "message": f"Existing user {data.full_name} linked as rep"}
-
-    invite_id = str(uuid.uuid4())
-    invite_doc = {
-        "id": invite_id,
-        "company_id": company_id,
-        "email": data.email,
-        "full_name": data.full_name,
-        "invited_by": current_user["id"],
-        "status": "pending",
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.invites.insert_one(invite_doc)
-    return {"success": True, "invite_id": invite_id, "invite_link": f"/invite/{invite_id}", "message": f"Invite created for {data.email}"}
+        
+        company_doc.pop("_id", None)
+        logger.info(f"Company created: {data.name} by user {current_user['id']}")
+        return {"success": True, "company": company_doc}
+        
+    except ClearDealException:
+        raise
+    except Exception as e:
+        logger.error(f"Company creation error: {e}")
+        raise DatabaseError(message="Failed to create company. Please try again.")
 
 
-@api_router.get("/companies/{company_id}/reps")
+@api_router.get("/companies/me", tags=["Companies"])
+async def get_my_company(current_user=Depends(get_current_user)):
+    """Get current user's company details"""
+    company_id = check_company_exists(current_user, "view company details")
+    
+    try:
+        company = await db.companies.find_one({"id": company_id}, {"_id": 0})
+        if not company:
+            raise ResourceNotFoundError("Company", company_id)
+        return {"success": True, "company": company}
+    except ClearDealException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching company: {e}")
+        raise DatabaseError(message="Failed to retrieve company details")
+
+
+@api_router.post("/companies/verify-gst", tags=["Companies"])
+async def verify_gst(current_user=Depends(get_current_user)):
+    """Verify company GST number (MOCKED - simulates Masters India API)"""
+    company_id = check_company_exists(current_user, "verify GST")
+    
+    try:
+        # MOCKED: In production, integrate with Masters India API
+        await db.companies.update_one(
+            {"id": company_id},
+            {"$set": {"gst_verified": True, "gst_verified_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        logger.info(f"GST verified (mocked) for company {company_id}")
+        return {"success": True, "message": "GST verified successfully", "mocked": True}
+    except Exception as e:
+        logger.error(f"GST verification error: {e}")
+        raise ExternalServiceError(
+            service_name="GST Verification",
+            message="GST verification service temporarily unavailable",
+            error_code=ErrorCode.EXTERNAL_GST_VERIFICATION_FAILED
+        )
+
+
+@api_router.post("/companies/verify-aadhaar", tags=["Companies"])
+async def verify_aadhaar(data: AadhaarVerifyData, current_user=Depends(get_current_user)):
+    """Verify director's Aadhaar via DigiLocker (MOCKED)"""
+    company_id = check_company_exists(current_user, "verify Aadhaar")
+    
+    try:
+        # MOCKED: In production, integrate with DigiLocker API
+        await db.companies.update_one(
+            {"id": company_id},
+            {"$set": {"aadhaar_verified": True, "aadhaar_verified_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        logger.info(f"Aadhaar verified (mocked) for company {company_id}")
+        return {"success": True, "message": "Aadhaar verified via DigiLocker", "mocked": True}
+    except Exception as e:
+        logger.error(f"Aadhaar verification error: {e}")
+        raise ExternalServiceError(
+            service_name="Aadhaar Verification",
+            message="DigiLocker service temporarily unavailable"
+        )
+
+
+@api_router.post("/companies/verify-bank", tags=["Companies"])
+async def verify_bank(data: BankVerifyData, current_user=Depends(get_current_user)):
+    """Verify bank account via penny-drop (MOCKED - simulates Razorpay)"""
+    company_id = check_company_exists(current_user, "verify bank account")
+    
+    try:
+        # Validate IFSC format
+        ifsc_pattern = re.compile(r'^[A-Z]{4}0[A-Z0-9]{6}$')
+        if not ifsc_pattern.match(data.ifsc_code.upper()):
+            raise BusinessLogicError(
+                error_code=ErrorCode.VALIDATION_INVALID_FORMAT,
+                message="Invalid IFSC code format. Expected format: SBIN0001234",
+                details={"field": "ifsc_code", "value": data.ifsc_code}
+            )
+        
+        # MOCKED: In production, integrate with Razorpay penny-drop
+        await db.companies.update_one(
+            {"id": company_id},
+            {"$set": {
+                "bank_verified": True,
+                "bank_account": {
+                    "account_number_masked": f"XXXX{data.account_number[-4:]}",
+                    "ifsc_code": data.ifsc_code.upper(),
+                    "account_holder_name": data.account_holder_name.strip()
+                },
+                "verified_badge": True,
+                "bank_verified_at": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+        logger.info(f"Bank verified (mocked) for company {company_id}")
+        return {"success": True, "message": "Bank account verified via penny-drop", "mocked": True}
+    except ClearDealException:
+        raise
+    except Exception as e:
+        logger.error(f"Bank verification error: {e}")
+        raise ExternalServiceError(
+            service_name="Bank Verification",
+            message="Bank verification service temporarily unavailable",
+            error_code=ErrorCode.EXTERNAL_BANK_VERIFICATION_FAILED
+        )
+
+
+@api_router.post("/companies/invite-rep", tags=["Companies"])
+async def invite_rep(data: RepInvite, current_user=Depends(get_current_user)):
+    """Invite a representative to join the organization"""
+    company_id = check_company_exists(current_user, "invite representatives")
+    
+    # Only managers can invite reps
+    if current_user.get("role") == "rep":
+        raise AuthorizationError(message="Only organization managers can invite representatives")
+    
+    try:
+        email = validate_email_format(data.email)
+        
+        # Check if user already exists
+        existing_user = await db.users.find_one({"email": email})
+        if existing_user:
+            if existing_user.get("company_id") == company_id:
+                raise BusinessLogicError(
+                    error_code=ErrorCode.RESOURCE_ALREADY_EXISTS,
+                    message="This user is already a member of your organization"
+                )
+            # Link existing user to company
+            await db.users.update_one(
+                {"email": email},
+                {"$set": {"company_id": company_id, "role": "rep"}}
+            )
+            logger.info(f"Existing user {email} linked as rep to company {company_id}")
+            return {"success": True, "message": f"{data.full_name} has been linked to your organization as a representative"}
+
+        # Create new invite
+        invite_id = str(uuid.uuid4())
+        invite_doc = {
+            "id": invite_id,
+            "company_id": company_id,
+            "email": email,
+            "full_name": data.full_name.strip(),
+            "invited_by": current_user["id"],
+            "invited_by_name": current_user.get("full_name", "Manager"),
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+        }
+        await db.invites.insert_one(invite_doc)
+        
+        logger.info(f"Rep invite created for {email} by {current_user['id']}")
+        return {
+            "success": True,
+            "invite_id": invite_id,
+            "invite_link": f"/invite/{invite_id}",
+            "message": f"Invitation sent to {email}. The link expires in 7 days."
+        }
+        
+    except ClearDealException:
+        raise
+    except Exception as e:
+        logger.error(f"Invite creation error: {e}")
+        raise DatabaseError(message="Failed to create invitation. Please try again.")
+
+
+@api_router.get("/companies/{company_id}/reps", tags=["Companies"])
 async def get_company_reps(company_id: str, current_user=Depends(get_current_user)):
-    reps = await db.users.find(
-        {"company_id": company_id, "role": "rep"},
-        {"_id": 0, "password_hash": 0}
-    ).to_list(100)
-    return reps
+    """Get all representatives in a company"""
+    # Verify user belongs to this company
+    if current_user.get("company_id") != company_id and current_user.get("role") == "rep":
+        raise AuthorizationError(message="You can only view representatives in your own organization")
+    
+    try:
+        reps = await db.users.find(
+            {"company_id": company_id, "role": "rep"},
+            {"_id": 0, "password_hash": 0}
+        ).to_list(100)
+        return {"success": True, "reps": reps, "count": len(reps)}
+    except Exception as e:
+        logger.error(f"Error fetching reps: {e}")
+        raise DatabaseError(message="Failed to retrieve representatives")
 
 
 # ============ BILLBOARD ROUTES ============
-@api_router.post("/billboards")
+@api_router.post("/billboards", tags=["Billboards"])
 async def create_billboard(data: BillboardCreate, current_user=Depends(get_current_user)):
+    """Create a new billboard listing"""
     if current_user["role"] != "owner":
-        raise HTTPException(status_code=403, detail="Only billboard owners can create listings")
-    company_id = current_user.get("company_id")
-    if not company_id:
-        raise HTTPException(status_code=400, detail="Please complete company setup first")
+        raise AuthorizationError(message="Only billboard owners can create listings")
+    
+    company_id = check_company_exists(current_user, "create billboard listings")
+    
+    try:
+        # Validate price
+        validate_positive_amount(data.base_monthly_rate, "Base monthly rate")
+        if data.min_acceptable_price:
+            validate_positive_amount(data.min_acceptable_price, "Minimum acceptable price")
+        
+        billboard_id = str(uuid.uuid4())
+        billboard_doc = {
+            "id": billboard_id,
+            "title": data.title.strip(),
+            "address": data.address.strip(),
+            "lat": data.lat,
+            "lng": data.lng,
+            "dimensions": {
+                "width": data.dimensions_width,
+                "height": data.dimensions_height,
+                "sqft": round(data.dimensions_width * data.dimensions_height, 2)
+            },
+            "board_type": data.board_type,
+            "illumination": data.illumination,
+            "facing": data.facing,
+            "base_monthly_rate": data.base_monthly_rate,
+            "min_booking_period": data.min_booking_period,
+            "available_from": data.available_from,
+            "min_acceptable_price": data.min_acceptable_price,
+            "max_rep_discount_percent": data.max_rep_discount_percent,
+            "photos": data.photos or [],
+            "description": data.description,
+            "status": BillboardStatus.DRAFT,
+            "owner_company_id": company_id,
+            "owner_id": current_user["id"],
+            "view_count": 0,
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        
+        await db.billboards.insert_one(billboard_doc)
+        billboard_doc.pop("_id", None)
+        
+        logger.info(f"Billboard created: {data.title} by user {current_user['id']}")
+        return {"success": True, "billboard": billboard_doc}
+        
+    except ClearDealException:
+        raise
+    except Exception as e:
+        logger.error(f"Billboard creation error: {e}")
+        raise DatabaseError(message="Failed to create billboard listing")
 
-    billboard_id = str(uuid.uuid4())
-    billboard_doc = {
-        "id": billboard_id,
-        "title": data.title,
-        "address": data.address,
-        "lat": data.lat,
-        "lng": data.lng,
-        "dimensions": {
-            "width": data.dimensions_width,
-            "height": data.dimensions_height,
-            "sqft": round(data.dimensions_width * data.dimensions_height, 2)
-        },
-        "board_type": data.board_type,
-        "illumination": data.illumination,
-        "facing": data.facing,
-        "base_monthly_rate": data.base_monthly_rate,
-        "min_booking_period": data.min_booking_period,
-        "available_from": data.available_from,
-        "min_acceptable_price": data.min_acceptable_price,
-        "max_rep_discount_percent": data.max_rep_discount_percent,
-        "photos": data.photos or [],
-        "description": data.description,
-        "status": BillboardStatus.DRAFT,
-        "owner_company_id": company_id,
-        "owner_id": current_user["id"],
-        "view_count": 0,
-        "created_at": datetime.now(timezone.utc).isoformat()
-    }
-    await db.billboards.insert_one(billboard_doc)
-    billboard_doc.pop("_id", None)
-    return billboard_doc
 
-
-@api_router.get("/billboards/my")
+@api_router.get("/billboards/my", tags=["Billboards"])
 async def get_my_billboards(current_user=Depends(get_current_user)):
+    """Get all billboards owned by current user's company"""
     company_id = current_user.get("company_id")
     if not company_id:
-        return []
-    billboards = await db.billboards.find({"owner_company_id": company_id}, {"_id": 0}).to_list(200)
-    return billboards
+        return {"success": True, "billboards": [], "count": 0}
+    
+    try:
+        billboards = await db.billboards.find(
+            {"owner_company_id": company_id},
+            {"_id": 0}
+        ).to_list(200)
+        return {"success": True, "billboards": billboards, "count": len(billboards)}
+    except Exception as e:
+        logger.error(f"Error fetching billboards: {e}")
+        raise DatabaseError(message="Failed to retrieve billboards")
 
 
-@api_router.get("/billboards")
+@api_router.get("/billboards", tags=["Billboards"])
 async def search_billboards(
     area: Optional[str] = None,
     min_price: Optional[float] = None,
     max_price: Optional[float] = None,
     board_type: Optional[str] = None,
     illumination: Optional[str] = None,
-    status: Optional[str] = "active",
+    listing_status: Optional[str] = "active",
     current_user=Depends(get_current_user)
 ):
-    query = {}
-    if status:
-        query["status"] = status
-    if area:
-        query["address"] = {"$regex": area, "$options": "i"}
-    if board_type:
-        query["board_type"] = board_type
-    if illumination:
-        query["illumination"] = illumination
-    if min_price or max_price:
-        price_q = {}
-        if min_price:
-            price_q["$gte"] = min_price
-        if max_price:
-            price_q["$lte"] = max_price
-        query["base_monthly_rate"] = price_q
+    """Search and filter available billboards"""
+    try:
+        query = {}
+        if listing_status:
+            query["status"] = listing_status
+        if area:
+            query["address"] = {"$regex": area, "$options": "i"}
+        if board_type:
+            query["board_type"] = board_type
+        if illumination:
+            query["illumination"] = illumination
+        if min_price or max_price:
+            price_q = {}
+            if min_price:
+                price_q["$gte"] = min_price
+            if max_price:
+                price_q["$lte"] = max_price
+            query["base_monthly_rate"] = price_q
 
-    billboards = await db.billboards.find(
-        query,
-        {"_id": 0, "min_acceptable_price": 0, "max_rep_discount_percent": 0}
-    ).to_list(200)
-    return billboards
+        billboards = await db.billboards.find(
+            query,
+            {"_id": 0, "min_acceptable_price": 0, "max_rep_discount_percent": 0}
+        ).to_list(200)
+        
+        return {"success": True, "billboards": billboards, "count": len(billboards)}
+    except Exception as e:
+        logger.error(f"Billboard search error: {e}")
+        raise DatabaseError(message="Failed to search billboards")
 
 
-@api_router.get("/billboards/{billboard_id}")
+@api_router.get("/billboards/{billboard_id}", tags=["Billboards"])
 async def get_billboard(billboard_id: str, current_user=Depends(get_current_user)):
-    billboard = await db.billboards.find_one({"id": billboard_id}, {"_id": 0})
-    if not billboard:
-        raise HTTPException(status_code=404, detail="Billboard not found")
-    await db.billboards.update_one({"id": billboard_id}, {"$inc": {"view_count": 1}})
-    if current_user.get("company_id") != billboard.get("owner_company_id"):
-        billboard.pop("min_acceptable_price", None)
-        billboard.pop("max_rep_discount_percent", None)
-    return billboard
+    """Get detailed billboard information"""
+    try:
+        billboard = await db.billboards.find_one({"id": billboard_id}, {"_id": 0})
+        if not billboard:
+            raise ResourceNotFoundError("Billboard", billboard_id)
+        
+        # Increment view count
+        await db.billboards.update_one({"id": billboard_id}, {"$inc": {"view_count": 1}})
+        
+        # Hide sensitive pricing info from non-owners
+        if current_user.get("company_id") != billboard.get("owner_company_id"):
+            billboard.pop("min_acceptable_price", None)
+            billboard.pop("max_rep_discount_percent", None)
+        
+        return {"success": True, "billboard": billboard}
+    except ClearDealException:
+        raise
+    except Exception as e:
+        logger.error(f"Error fetching billboard: {e}")
+        raise DatabaseError(message="Failed to retrieve billboard details")
 
 
-@api_router.put("/billboards/{billboard_id}/status")
+@api_router.put("/billboards/{billboard_id}/status", tags=["Billboards"])
 async def update_billboard_status(billboard_id: str, data: BillboardStatusUpdate, current_user=Depends(get_current_user)):
-    billboard = await db.billboards.find_one({"id": billboard_id})
-    if not billboard:
-        raise HTTPException(status_code=404, detail="Billboard not found")
-    if billboard["owner_id"] != current_user["id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
-    await db.billboards.update_one({"id": billboard_id}, {"$set": {"status": data.status}})
-    return {"success": True, "status": data.status}
+    """Update billboard availability status"""
+    try:
+        billboard = await db.billboards.find_one({"id": billboard_id})
+        if not billboard:
+            raise ResourceNotFoundError("Billboard", billboard_id)
+        
+        if billboard["owner_id"] != current_user["id"]:
+            raise AuthorizationError(message="Only the billboard owner can change its status")
+        
+        # Validate status value
+        valid_statuses = ["draft", "active", "booked", "unavailable"]
+        if data.status not in valid_statuses:
+            raise BusinessLogicError(
+                error_code=ErrorCode.VALIDATION_INVALID_FORMAT,
+                message=f"Invalid status. Must be one of: {', '.join(valid_statuses)}",
+                details={"valid_statuses": valid_statuses}
+            )
+        
+        await db.billboards.update_one(
+            {"id": billboard_id},
+            {"$set": {"status": data.status, "updated_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        
+        logger.info(f"Billboard {billboard_id} status updated to {data.status}")
+        return {"success": True, "status": data.status}
+    except ClearDealException:
+        raise
+    except Exception as e:
+        logger.error(f"Status update error: {e}")
+        raise DatabaseError(message="Failed to update billboard status")
 
 
 # ============ DEAL ROUTES ============
@@ -1485,6 +1861,25 @@ app.add_middleware(
 )
 
 
-@app.on_event("shutdown")
-async def shutdown_db_client():
-    client.close()
+# ============ HEALTH CHECK ============
+@app.get("/health", tags=["System"])
+async def health_check():
+    """System health check endpoint"""
+    try:
+        await client.admin.command('ping')
+        db_status = "connected"
+    except Exception:
+        db_status = "disconnected"
+    
+    return {
+        "status": "healthy",
+        "version": "2.0.0",
+        "database": db_status,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+@api_router.get("/health", tags=["System"])
+async def api_health():
+    """API health check"""
+    return {"status": "ok", "api_version": "2.0.0"}
