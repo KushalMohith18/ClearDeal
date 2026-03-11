@@ -1076,20 +1076,35 @@ async def accept_offer(deal_id: str, current_user=Depends(get_current_user)):
 
 @api_router.post("/deals/{deal_id}/approve")
 async def approve_deal(deal_id: str, current_user=Depends(get_current_user)):
+    """Approve a deal - Only owners/managers can approve, not reps"""
+    # Reps cannot approve deals
+    if current_user.get("role") == "rep":
+        raise AuthorizationError(
+            message="Only organization owners/managers can approve deals. Please ask your manager to approve."
+        )
+    
     deal = await db.deals.find_one({"id": deal_id}, {"_id": 0})
     if not deal:
-        raise HTTPException(status_code=404, detail="Deal not found")
+        raise ResourceNotFoundError("Deal", deal_id)
     if deal["status"] != "pending_approval":
-        raise HTTPException(status_code=400, detail="Deal is not pending approval")
+        raise DealStateError(
+            current_state=deal["status"],
+            required_states=["pending_approval"],
+            action="approve deal"
+        )
 
     company_id = current_user.get("company_id")
     update_data = {}
     if company_id == deal["buyer_company_id"]:
         update_data["buyer_approved"] = True
+        update_data["buyer_approved_by"] = current_user["id"]
+        update_data["buyer_approved_at"] = datetime.now(timezone.utc).isoformat()
     elif company_id == deal["seller_company_id"]:
         update_data["seller_approved"] = True
+        update_data["seller_approved_by"] = current_user["id"]
+        update_data["seller_approved_at"] = datetime.now(timezone.utc).isoformat()
     else:
-        raise HTTPException(status_code=403, detail="Not authorized to approve this deal")
+        raise AuthorizationError(message="You are not authorized to approve this deal")
 
     update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
     await db.deals.update_one({"id": deal_id}, {"$set": update_data})
@@ -1100,19 +1115,33 @@ async def approve_deal(deal_id: str, current_user=Depends(get_current_user)):
             {"id": deal_id},
             {"$set": {"status": DealStatus.APPROVED, "updated_at": datetime.now(timezone.utc).isoformat()}}
         )
+        # Notify both parties
+        await create_notification(
+            deal["seller_id"], "deal_approved", "Deal Fully Approved",
+            f"Deal for {deal.get('billboard_title', 'billboard')} is approved and ready for payment.",
+            deal_id
+        )
         return {"success": True, "fully_approved": True, "status": "approved"}
     return {"success": True, "fully_approved": False, "status": "partial_approval"}
 
 
 @api_router.post("/deals/{deal_id}/reject")
 async def reject_deal(deal_id: str, current_user=Depends(get_current_user)):
+    """Reject a deal and re-open negotiation - Only owners/managers can reject"""
+    # Reps cannot reject deals
+    if current_user.get("role") == "rep":
+        raise AuthorizationError(
+            message="Only organization owners/managers can reject deals. Please contact your manager."
+        )
+    
     deal = await db.deals.find_one({"id": deal_id}, {"_id": 0})
     if not deal:
-        raise HTTPException(status_code=404, detail="Deal not found")
+        raise ResourceNotFoundError("Deal", deal_id)
+    
     company_id = current_user.get("company_id")
     has_access = (company_id == deal["seller_company_id"] or company_id == deal["buyer_company_id"])
     if not has_access:
-        raise HTTPException(status_code=403, detail="Access denied")
+        raise AuthorizationError(message="You are not authorized to reject this deal")
 
     await db.deals.update_one(
         {"id": deal_id},
@@ -1132,20 +1161,36 @@ async def reject_deal(deal_id: str, current_user=Depends(get_current_user)):
         "sender_role": current_user["role"],
         "message_type": MessageType.SYSTEM,
         "amount": None,
-        "message": "Deal rejected. Negotiation re-opened.",
+        "message": f"Deal rejected by {current_user['full_name']}. Negotiation re-opened.",
         "is_accepted": False,
         "created_at": datetime.now(timezone.utc).isoformat()
     })
+    logger.info(f"Deal {deal_id} rejected by user {current_user['id']}")
     return {"success": True, "status": "negotiating"}
 
 
 @api_router.post("/deals/{deal_id}/pay")
 async def process_payment(deal_id: str, current_user=Depends(get_current_user)):
+    """Process payment for a deal - Only brand owner/manager can pay, not reps"""
+    # Reps cannot make payments
+    if current_user.get("role") == "rep":
+        raise AuthorizationError(
+            message="Only organization owners/managers can process payments. Please ask your manager to complete the payment."
+        )
+    
     deal = await db.deals.find_one({"id": deal_id}, {"_id": 0})
     if not deal:
-        raise HTTPException(status_code=404, detail="Deal not found")
+        raise ResourceNotFoundError("Deal", deal_id)
     if deal["status"] != "approved":
-        raise HTTPException(status_code=400, detail="Deal must be approved before payment")
+        raise DealStateError(
+            current_state=deal["status"],
+            required_states=["approved"],
+            action="process payment"
+        )
+    
+    # Only buyer can make payment
+    if current_user.get("company_id") != deal["buyer_company_id"]:
+        raise AuthorizationError(message="Only the buyer organization can process payment for this deal")
 
     final_price = deal["final_price"]
     platform_commission = round(final_price * (deal["platform_commission_pct"] / 100), 2)

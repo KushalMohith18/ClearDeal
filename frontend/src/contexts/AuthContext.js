@@ -14,7 +14,11 @@ export const AuthProvider = ({ children }) => {
       axios.get(`${API}/auth/me`, {
         headers: { Authorization: `Bearer ${token}` }
       })
-        .then(res => setUser(res.data))
+        .then(res => {
+          // Handle both response formats: { user: {...} } or {...}
+          const userData = res.data?.user || res.data;
+          setUser(userData);
+        })
         .catch(() => {
           localStorage.removeItem('cd_token');
           setToken(null);
@@ -26,7 +30,9 @@ export const AuthProvider = ({ children }) => {
   }, [token]);
 
   const login = (userData, authToken) => {
-    setUser(userData);
+    // Handle both formats
+    const user = userData?.user || userData;
+    setUser(user);
     setToken(authToken);
     localStorage.setItem('cd_token', authToken);
   };
@@ -38,20 +44,28 @@ export const AuthProvider = ({ children }) => {
   };
 
   const refreshUser = async () => {
-    if (!token) return;
+    if (!token) return null;
     try {
       const res = await axios.get(`${API}/auth/me`, {
         headers: { Authorization: `Bearer ${token}` }
       });
-      setUser(res.data);
-      return res.data;
+      // Handle both response formats
+      const userData = res.data?.user || res.data;
+      setUser(userData);
+      return userData;
     } catch (e) {
+      console.error('Failed to refresh user:', e);
       return null;
     }
   };
 
+  // Update user data locally (for after company creation)
+  const updateUser = (updates) => {
+    setUser(prev => ({ ...prev, ...updates }));
+  };
+
   return (
-    <AuthContext.Provider value={{ user, token, login, logout, loading, setUser, refreshUser }}>
+    <AuthContext.Provider value={{ user, token, login, logout, loading, setUser, refreshUser, updateUser }}>
       {children}
     </AuthContext.Provider>
   );

@@ -17,7 +17,7 @@ const COMPANY_TYPES = [
 ];
 
 const Onboarding = () => {
-  const { user, refreshUser } = useAuth();
+  const { user, refreshUser, updateUser } = useAuth();
   const navigate = useNavigate();
   const [step, setStep] = useState(1);
   const [loading, setLoading] = useState(false);
@@ -50,11 +50,18 @@ const Onboarding = () => {
     setLoading(true);
     try {
       const res = await api.post('/companies', companyForm);
-      setCompany(res.data);
+      // Extract company from response (handle both formats)
+      const companyData = res.data?.company || res.data;
+      setCompany(companyData);
+      // Update user context with new company_id
+      if (companyData?.id) {
+        updateUser({ company_id: companyData.id });
+      }
       toast.success('Company registered!');
       setStep(2);
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to create company');
+      const errorMsg = err.response?.data?.error?.message || err.response?.data?.detail || 'Failed to create company';
+      toast.error(errorMsg);
     } finally {
       setLoading(false);
     }
@@ -106,9 +113,19 @@ const Onboarding = () => {
   };
 
   const handleFinish = async () => {
-    await refreshUser();
-    toast.success('Onboarding complete! Welcome to ClearDeal.');
-    navigate('/dashboard');
+    // Refresh user data from server to ensure company_id is set
+    const updatedUser = await refreshUser();
+    if (updatedUser?.company_id) {
+      toast.success('Onboarding complete! Welcome to ClearDeal.');
+      navigate('/dashboard');
+    } else {
+      // Fallback: manually set company_id if we have it locally
+      if (company?.id) {
+        updateUser({ company_id: company.id });
+      }
+      toast.success('Onboarding complete! Welcome to ClearDeal.');
+      navigate('/dashboard');
+    }
   };
 
   return (
