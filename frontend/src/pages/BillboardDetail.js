@@ -178,8 +178,10 @@ const BillboardDetail = () => {
   if (!billboard) return null;
 
   const bench = getBenchmark(billboard.address);
-  const canMakeOffer = ['rep', 'brand_manager'].includes(user?.role) && billboard.status === 'active';
   const isOwner = user?.company_id === billboard.owner_company_id;
+  // All users (rep, brand_manager, or owner buying from another owner) can make offers
+  // except the owner of THIS billboard
+  const canMakeOffer = !isOwner && billboard.status === 'active' && user?.company_id;
   const benchMid = (bench.min + bench.max) / 2;
   const priceDiffPct = benchMid > 0 ? Math.round(((billboard.base_monthly_rate - benchMid) / benchMid) * 100) : 0;
 

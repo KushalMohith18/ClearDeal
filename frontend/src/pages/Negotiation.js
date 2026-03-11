@@ -283,15 +283,22 @@ const Negotiation = () => {
 
   if (!deal) return null;
 
+  // Determine party relationships
   const isSellerParty = deal.seller_company_id === user?.company_id;
   const isBuyerParty = deal.buyer_company_id === user?.company_id || deal.rep_id === user?.id;
-  const canApprove = deal.status === 'pending_approval' && (
+  const isRep = user?.role === 'rep';
+  const isManager = ['owner', 'brand_manager'].includes(user?.role);
+  
+  // Permission checks
+  // Reps CAN negotiate but CANNOT approve/pay
+  // Managers CAN do everything: negotiate, approve, pay
+  const canApprove = deal.status === 'pending_approval' && isManager && (
     (isSellerParty && !deal.seller_approved) ||
-    (isBuyerParty && !deal.buyer_approved && user?.role !== 'rep')
+    (isBuyerParty && !deal.buyer_approved)
   );
-  const canPay = deal.status === 'approved' && isBuyerParty && user?.role !== 'rep';
-  const canNegotiate = deal.status === 'negotiating';
-  const canLockThread = ['owner', 'brand_manager'].includes(user?.role) && (isSellerParty || isBuyerParty);
+  const canPay = deal.status === 'approved' && isBuyerParty && isManager;
+  const canNegotiate = deal.status === 'negotiating' && (isSellerParty || isBuyerParty);
+  const canLockThread = isManager && (isSellerParty || isBuyerParty);
   const canRaiseDispute = ['paid', 'active'].includes(deal.status) && (isSellerParty || isBuyerParty) && !deal.has_dispute;
   const showContract = ['pending_approval', 'approved', 'paid', 'active', 'completed'].includes(deal.status);
 
@@ -359,10 +366,10 @@ const Negotiation = () => {
                 {/* Message Type Selector */}
                 <div className="flex gap-1.5 mb-3">
                   {[
-                    { val: 'text', label: 'Message' },
+                    { val: 'text', label: 'Message', show: true },
                     { val: 'offer', label: 'Make Offer', show: isBuyerParty },
                     { val: 'counter_offer', label: 'Counter Offer', show: isSellerParty },
-                  ].filter(t => t.show !== false).map(t => (
+                  ].filter(t => t.show).map(t => (
                     <button
                       key={t.val}
                       onClick={() => setMsgType(t.val)}
@@ -375,6 +382,13 @@ const Negotiation = () => {
                     </button>
                   ))}
                 </div>
+
+                {/* Rep price band notice */}
+                {isRep && (msgType === 'offer' || msgType === 'counter_offer') && (
+                  <div className="mb-2 p-2 bg-amber-50 border border-amber-200 rounded text-xs text-amber-700">
+                    <strong>Note:</strong> As a rep, your offers must stay within the price band set by your manager.
+                  </div>
+                )}
 
                 {(msgType === 'offer' || msgType === 'counter_offer') && (
                   <div className="mb-2">
@@ -502,7 +516,12 @@ const Negotiation = () => {
                     </button>
                   </div>
                 )}
-                {!canApprove && (
+                {!canApprove && isRep && (isSellerParty || isBuyerParty) && (
+                  <p className="text-xs text-amber-600 text-center bg-amber-50 p-2 rounded">
+                    Only managers can approve deals. Please notify your manager.
+                  </p>
+                )}
+                {!canApprove && isManager && (
                   <p className="text-xs text-slate-500 text-center">Waiting for other party's approval</p>
                 )}
               </div>
