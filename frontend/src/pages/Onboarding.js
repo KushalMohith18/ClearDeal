@@ -23,6 +23,13 @@ const Onboarding = () => {
   const [loading, setLoading] = useState(false);
   const [company, setCompany] = useState(null);
 
+  // Redirect reps to waiting page - they shouldn't create companies
+  React.useEffect(() => {
+    if (user?.role === 'rep') {
+      navigate('/rep-waiting');
+    }
+  }, [user, navigate]);
+
   const [companyForm, setCompanyForm] = useState({
     name: '',
     gst_number: '',

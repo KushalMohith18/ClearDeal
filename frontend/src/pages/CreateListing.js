@@ -86,15 +86,20 @@ const CreateListing = () => {
         max_rep_discount_percent: form.max_rep_discount_percent ? parseFloat(form.max_rep_discount_percent) : null,
       };
       const res = await api.post('/billboards', payload);
-      if (publish) {
-        await api.put(`/billboards/${res.data.id}/status`, { status: 'active' });
+      // Handle response format: { success: true, billboard: {...} }
+      const billboard = res.data?.billboard || res.data;
+      const billboardId = billboard?.id;
+      
+      if (publish && billboardId) {
+        await api.put(`/billboards/${billboardId}/status`, { status: 'active' });
         toast.success('Billboard listed and published!');
       } else {
         toast.success('Billboard saved as draft!');
       }
       navigate('/dashboard');
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Failed to create listing');
+      const errorMsg = err.response?.data?.error?.message || err.response?.data?.detail || 'Failed to create listing';
+      toast.error(errorMsg);
     } finally {
       setLoading(false);
     }

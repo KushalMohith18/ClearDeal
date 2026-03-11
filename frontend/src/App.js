@@ -15,6 +15,7 @@ import Negotiation from './pages/Negotiation';
 import InviteAccept from './pages/InviteAccept';
 import RepPerformance from './pages/RepPerformance';
 import Campaigns from './pages/Campaigns';
+import RepWaiting from './pages/RepWaiting';
 
 import './App.css';
 
@@ -47,9 +48,10 @@ const AppRoutes = () => {
   return (
     <Routes>
       <Route path="/" element={user ? <Navigate to="/dashboard" replace /> : <Landing />} />
-      <Route path="/auth" element={user ? <Navigate to={user.company_id ? "/dashboard" : "/onboarding"} replace /> : <Auth />} />
+      <Route path="/auth" element={user ? <Navigate to={user.company_id ? "/dashboard" : (user.role === 'rep' ? "/rep-waiting" : "/onboarding")} replace /> : <Auth />} />
       <Route path="/invite/:inviteId" element={<InviteAccept />} />
       <Route path="/onboarding" element={<ProtectedRoute><Onboarding /></ProtectedRoute>} />
+      <Route path="/rep-waiting" element={<ProtectedRoute><RepWaiting /></ProtectedRoute>} />
       <Route path="/dashboard" element={<ProtectedRoute><Dashboard /></ProtectedRoute>} />
       <Route path="/browse" element={<ProtectedRoute><BillboardBrowse /></ProtectedRoute>} />
       <Route path="/billboards/new" element={<ProtectedRoute><CreateListing /></ProtectedRoute>} />

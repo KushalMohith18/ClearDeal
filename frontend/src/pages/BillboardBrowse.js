@@ -120,9 +120,12 @@ const BillboardBrowse = () => {
       if (filters.board_type) params.board_type = filters.board_type;
       if (filters.illumination) params.illumination = filters.illumination;
       const res = await api.get('/billboards', { params });
-      setBillboards(res.data);
+      // Handle both response formats: { billboards: [...] } or [...]
+      const data = res.data?.billboards || res.data || [];
+      setBillboards(Array.isArray(data) ? data : []);
     } catch (err) {
       toast.error('Failed to load billboards');
+      setBillboards([]);
     } finally {
       setLoading(false);
     }

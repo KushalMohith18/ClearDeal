@@ -1,14 +1,14 @@
 import React, { useState, useEffect } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
-import { Building2, Eye, EyeOff, ArrowLeft } from 'lucide-react';
+import { Building2, Eye, EyeOff, ArrowLeft, Users, Search } from 'lucide-react';
 import api from '../utils/api';
 import { toast } from 'sonner';
 
 const ROLES = [
   { value: 'owner', label: 'Billboard Owner', desc: 'I own billboard/hoarding inventory' },
   { value: 'brand_manager', label: 'Brand Manager', desc: 'I buy billboard space for my brand' },
-  { value: 'rep', label: 'Negotiation Rep', desc: 'I negotiate deals for a company' },
+  { value: 'rep', label: 'Negotiation Rep', desc: 'I negotiate deals for a company (need invite from a company)' },
 ];
 
 const Auth = () => {
@@ -32,18 +32,33 @@ const Auth = () => {
     setLoading(true);
     try {
       if (mode === 'register') {
+        // Reps should not self-register - they need an invite
+        if (form.role === 'rep') {
+          toast.error('Reps cannot self-register. Please ask a company manager for an invite link.');
+          setLoading(false);
+          return;
+        }
+        
         const res = await api.post('/auth/register', form);
         login(res.data.user, res.data.token);
         toast.success('Account created successfully!');
         navigate(res.data.user.company_id ? '/dashboard' : '/onboarding');
       } else {
         const res = await api.post('/auth/login', { email: form.email, password: form.password });
-        login(res.data.user, res.data.token);
-        toast.success(`Welcome back, ${res.data.user.full_name}!`);
-        navigate(res.data.user.company_id ? '/dashboard' : '/onboarding');
+        const userData = res.data.user;
+        login(userData, res.data.token);
+        toast.success(`Welcome back, ${userData.full_name}!`);
+        
+        // Reps with company go to dashboard, without company go to rep waiting page
+        if (userData.role === 'rep') {
+          navigate(userData.company_id ? '/dashboard' : '/rep-waiting');
+        } else {
+          navigate(userData.company_id ? '/dashboard' : '/onboarding');
+        }
       }
     } catch (err) {
-      toast.error(err.response?.data?.detail || 'Authentication failed');
+      const errorMsg = err.response?.data?.error?.message || err.response?.data?.detail || 'Authentication failed';
+      toast.error(errorMsg);
     } finally {
       setLoading(false);
     }
